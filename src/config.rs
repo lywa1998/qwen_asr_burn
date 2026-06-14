@@ -1,0 +1,100 @@
+use serde::Deserialize;
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ModelConfig {
+    pub thinker_config: ThinkerConfigRaw,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ThinkerConfigRaw {
+    pub audio_config: AudioEncoderConfig,
+    pub text_config: TextConfig,
+    pub audio_start_token_id: u32,
+    pub audio_end_token_id: u32,
+    pub audio_token_id: u32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AudioEncoderConfig {
+    pub d_model: usize,
+    pub encoder_attention_heads: usize,
+    pub encoder_ffn_dim: usize,
+    pub encoder_layers: usize,
+    pub downsample_hidden_size: usize,
+    pub num_mel_bins: usize,
+    pub output_dim: usize,
+    pub max_source_positions: usize,
+    pub activation_function: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TextConfig {
+    pub hidden_size: usize,
+    pub num_attention_heads: usize,
+    pub num_key_value_heads: usize,
+    pub head_dim: usize,
+    pub intermediate_size: usize,
+    pub num_hidden_layers: usize,
+    pub vocab_size: usize,
+    pub rms_norm_eps: f64,
+    pub rope_theta: f64,
+    pub hidden_act: String,
+    pub max_position_embeddings: usize,
+    pub use_cache: bool,
+    pub tie_word_embeddings: bool,
+    #[serde(default)]
+    pub attention_bias: bool,
+    pub rope_scaling: Option<RopeScalingConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RopeScalingConfig {
+    pub interleaved: Option<bool>,
+    pub mrope_interleaved: Option<bool>,
+    #[serde(default)]
+    pub mrope_section: Vec<usize>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PreprocessorConfig {
+    pub feature_size: usize,
+    pub n_fft: usize,
+    pub hop_length: usize,
+    pub n_samples: usize,
+    pub nb_max_frames: usize,
+    pub chunk_length: f32,
+    pub padding_value: f64,
+    pub return_attention_mask: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GenerationConfig {
+    pub eos_token_id: Vec<u32>,
+    pub pad_token_id: u32,
+    pub do_sample: bool,
+    pub temperature: f64,
+}
+
+impl ModelConfig {
+    pub fn from_dir(model_dir: &str) -> anyhow::Result<Self> {
+        let path = format!("{}/config.json", model_dir);
+        let content = std::fs::read_to_string(&path)?;
+        Ok(serde_json::from_str(&content)?)
+    }
+}
+
+impl PreprocessorConfig {
+    pub fn from_dir(model_dir: &str) -> anyhow::Result<Self> {
+        let path = format!("{}/preprocessor_config.json", model_dir);
+        let content = std::fs::read_to_string(&path)?;
+        Ok(serde_json::from_str(&content)?)
+    }
+}
+
+impl GenerationConfig {
+    pub fn from_dir(model_dir: &str) -> anyhow::Result<Self> {
+        let path = format!("{}/generation_config.json", model_dir);
+        let content = std::fs::read_to_string(&path)?;
+        Ok(serde_json::from_str(&content)?)
+    }
+}
