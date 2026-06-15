@@ -10,10 +10,6 @@ use burn::tensor::{Bool, Int, Tensor};
 
 use crate::config::{AudioEncoderConfig, TextConfig};
 
-// ============================================================
-// Custom RMS Norm (uses "weight" field to match PyTorch naming)
-// ============================================================
-
 #[derive(Module, Debug)]
 pub struct MyRmsNorm<B: Backend> {
     pub weight: Param<Tensor<B, 1>>,
@@ -32,10 +28,6 @@ impl<B: Backend> MyRmsNorm<B> {
         x.div(rms).mul(w)
     }
 }
-
-// ============================================================
-// Custom Layer Norm (uses "gamma"/"beta" to match PyTorch Burn convention)
-// ============================================================
 
 #[derive(Module, Debug)]
 pub struct MyLayerNorm<B: Backend> {
@@ -66,81 +58,133 @@ impl<B: Backend> MyLayerNorm<B> {
     }
 }
 
-// ============================================================
-// MRoPE
-// ============================================================
-
-/// MRoPE matching Qwen3ASRThinkerTextRotaryEmbedding in Python reference
 pub struct MRoPE {
-    inv_freq: Vec<f32>,         // head_dim/2 frequencies, same denominator for all sections
-    pub total_rotary_dim: usize,
+    inv_freq: Vec<f32>,
+    dim_map: Vec<usize>,
+    head_dim: usize,
 }
 
 impl MRoPE {
-    pub fn new(head_dim: usize, rope_theta: f64, _mrope_section: &[usize]) -> Self {
-        // Single inv_freq using head_dim as denominator (matches Python rope_init_fn default)
-        let head_dim = head_dim; // 128 for Qwen3-0.6B
-        let mut inv_freq = Vec::new();
-        for i in (0..head_dim).step_by(2) {
-            let freq = 1.0 / (rope_theta.powf(i as f64 / head_dim as f64));
-            inv_freq.push(freq as f32);
-        }
-        let total_rotary_dim = head_dim / 2 * 2; // 64 for head_dim=128
-        Self { inv_freq, total_rotary_dim }
+    pub fn new(head_dim: usize, rope_theta: f64, mrope_section: &[usize], interleaved: bool) -> Self {
+        let half_dim = head_dim / 2;
+        let inv_freq = (0..half_dim)
+            .map(|i| (1.0 / rope_theta.powf(2.0 * i as f64 / head_dim as f64)) as f32)
+            .collect();
+        let dim_map = if interleaved {
+            build_interleaved_dim_map(mrope_section, half_dim)
+        } else {
+            build_contiguous_dim_map(mrope_section, half_dim)
+        };
+        Self { inv_freq, dim_map, head_dim }
     }
 
     pub fn compute_cos_sin<B: Backend>(
         &self,
         position_ids: Tensor<B, 2, Int>,
     ) -> (Tensor<B, 4>, Tensor<B, 4>) {
-        let [_batch, seq_len] = position_ids.dims();
+        let [batch, seq_len] = position_ids.dims();
         let device = position_ids.device();
+        let half_dim = self.head_dim / 2;
+        let pos_data = position_ids.to_data();
+        let mut pos_vals = Vec::with_capacity(batch * seq_len);
+        for chunk in pos_data.bytes.chunks_exact(4) {
+            pos_vals.push(i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+        }
 
-        // position_ids: [B, seq_len] → [B, seq_len, 1]
-        let pos = position_ids
-            .unsqueeze_dim::<3>(2)
-            .float();
+        let mut cos_vals = Vec::with_capacity(batch * seq_len * self.head_dim);
+        let mut sin_vals = Vec::with_capacity(batch * seq_len * self.head_dim);
+        for pos in pos_vals {
+            for j in 0..half_dim {
+                let mapped_pos = pos as f32;
+                let angle = mapped_pos * self.inv_freq[j];
+                cos_vals.push(angle.cos());
+                sin_vals.push(angle.sin());
+            }
+            for j in 0..half_dim {
+                let mapped_pos = pos as f32;
+                let angle = mapped_pos * self.inv_freq[j];
+                cos_vals.push(angle.cos());
+                sin_vals.push(angle.sin());
+            }
+        }
 
-        // inv_freq: [num_pairs] → [1, 1, num_pairs]
-        let inv_freq_t = Tensor::<B, 1>::from_floats(self.inv_freq.as_slice(), &device)
-            .unsqueeze_dim::<2>(0)
-            .unsqueeze_dim::<3>(1);
-
-        // freqs: [B, seq_len, num_pairs=64]
-        let freqs = pos.mul(inv_freq_t);
-
-        // Duplicate freqs: matching Python torch.cat((freqs, freqs), dim=-1)
-        let emb = Tensor::cat(vec![freqs.clone(), freqs.clone()], 2);
-        let cos = emb.clone().cos().unsqueeze_dim::<4>(1);
-        let sin = emb.sin().unsqueeze_dim::<4>(1);
-
+        let cos = Tensor::<B, 1>::from_floats(cos_vals.as_slice(), &device)
+            .reshape([batch, seq_len, self.head_dim])
+            .unsqueeze_dim::<4>(1);
+        let sin = Tensor::<B, 1>::from_floats(sin_vals.as_slice(), &device)
+            .reshape([batch, seq_len, self.head_dim])
+            .unsqueeze_dim::<4>(1);
         (cos, sin)
+    }
+
+    pub fn compute_cos_sin_from_positions<B: Backend>(
+        &self,
+        positions: &[usize],
+        device: &B::Device,
+    ) -> (Tensor<B, 4>, Tensor<B, 4>) {
+        let ids: Vec<i32> = positions.iter().map(|&pos| pos as i32).collect();
+        let position_ids = Tensor::<B, 1, Int>::from_ints(ids.as_slice(), device).unsqueeze_dim::<2>(0);
+        self.compute_cos_sin(position_ids)
     }
 }
 
-/// Apply RoPE rotation. Matches Python's apply_rotary_pos_emb:
-/// - q_embed = (q * cos) + (rotate_half(q) * sin)
-/// - rotate_half splits at head_dim/2 and swaps halves with negation
-/// - cos/sin should cover the full head_dim
+fn build_contiguous_dim_map(sections: &[usize], total: usize) -> Vec<usize> {
+    let mut map = Vec::with_capacity(total);
+    for (dim, &size) in sections.iter().enumerate() {
+        for _ in 0..size {
+            if map.len() >= total {
+                break;
+            }
+            map.push(dim);
+        }
+    }
+    while map.len() < total {
+        map.push(sections.len().saturating_sub(1));
+    }
+    map
+}
+
+fn build_interleaved_dim_map(sections: &[usize], total: usize) -> Vec<usize> {
+    let n_dims = sections.len().max(1);
+    let mut map = Vec::with_capacity(total);
+    let mut counts = vec![0usize; n_dims];
+
+    while map.len() < total {
+        let prev_len = map.len();
+        for dim in 0..n_dims {
+            if map.len() >= total {
+                break;
+            }
+            let limit = sections.get(dim).copied().unwrap_or(0);
+            if counts[dim] < limit {
+                map.push(dim);
+                counts[dim] += 1;
+            }
+        }
+        if map.len() == prev_len {
+            break;
+        }
+    }
+
+    while map.len() < total {
+        map.push(n_dims - 1);
+    }
+    map
+}
+
 fn apply_mrope_simple<B: Backend>(
     x: Tensor<B, 4>,
     cos: &Tensor<B, 4>,
     sin: &Tensor<B, 4>,
 ) -> Tensor<B, 4> {
-    // Python's rotate_half: split at half, cat((-x2, x1))
     let head_dim = x.dims()[3];
     let half = head_dim / 2;
     let x_clone = x.clone();
     let x1 = x_clone.clone().narrow(3, 0, half);
     let x2 = x_clone.narrow(3, half, half);
     let rotate_half = Tensor::cat(vec![x2.neg(), x1], 3);
-    // q_embed = (q * cos) + (rotate_half(q) * sin)
     x * cos.clone() + rotate_half * sin.clone()
 }
-
-// ============================================================
-// QK Normalization
-// ============================================================
 
 #[derive(Module, Debug)]
 pub struct QKNorm<B: Backend> {
@@ -157,9 +201,41 @@ impl<B: Backend> QKNorm<B> {
     }
 }
 
-// ============================================================
-// Qwen3 Attention
-// ============================================================
+#[derive(Debug)]
+pub struct KvCacheEntry<B: Backend> {
+    pub k: Tensor<B, 4>,
+    pub v: Tensor<B, 4>,
+}
+
+#[derive(Debug)]
+pub struct KvCache<B: Backend> {
+    layers: Vec<Option<KvCacheEntry<B>>>,
+}
+
+impl<B: Backend> KvCache<B> {
+    pub fn new(num_layers: usize) -> Self {
+        Self {
+            layers: (0..num_layers).map(|_| None).collect(),
+        }
+    }
+
+    pub fn layer(&self, index: usize) -> Option<&KvCacheEntry<B>> {
+        self.layers.get(index).and_then(|entry| entry.as_ref())
+    }
+
+    pub fn set_layer(&mut self, index: usize, entry: KvCacheEntry<B>) {
+        if let Some(slot) = self.layers.get_mut(index) {
+            *slot = Some(entry);
+        }
+    }
+
+    pub fn seq_len(&self) -> usize {
+        self.layers
+            .iter()
+            .find_map(|entry| entry.as_ref().map(|cache| cache.k.dims()[2]))
+            .unwrap_or(0)
+    }
+}
 
 #[derive(Module, Debug)]
 pub struct Qwen3Attention<B: Backend> {
@@ -181,33 +257,46 @@ impl<B: Backend> Qwen3Attention<B> {
     pub fn forward(
         &self,
         hidden_states: Tensor<B, 3>,
-        mrope: &MRoPE,
+        cos: &Tensor<B, 4>,
+        sin: &Tensor<B, 4>,
         causal_mask: Option<Tensor<B, 4, Bool>>,
-    ) -> Tensor<B, 3> {
+        kv_cache: Option<&KvCacheEntry<B>>,
+    ) -> (Tensor<B, 3>, KvCacheEntry<B>) {
         let [batch, seq_len, _hidden] = hidden_states.dims();
         let num_q_heads = self.num_q_heads;
         let num_kv_heads = self.num_kv_heads;
         let head_dim = self.head_dim;
-
-        let pos_ids = make_positions::<B>(seq_len, &hidden_states.device());
-        let (cos, sin) = mrope.compute_cos_sin(pos_ids);
 
         let q = self.q_proj.forward(hidden_states.clone());
         let k = self.k_proj.forward(hidden_states.clone());
         let v = self.v_proj.forward(hidden_states);
 
         let q = q.reshape([batch, seq_len, num_q_heads, head_dim]).swap_dims(1, 2);
-        let k = k.reshape([batch, seq_len, num_kv_heads, head_dim]).swap_dims(1, 2);
-        let v = v.reshape([batch, seq_len, num_kv_heads, head_dim]).swap_dims(1, 2);
+        let mut k = k.reshape([batch, seq_len, num_kv_heads, head_dim]).swap_dims(1, 2);
+        let mut v = v.reshape([batch, seq_len, num_kv_heads, head_dim]).swap_dims(1, 2);
 
         let q = self.q_norm.forward(q);
-        let k = self.k_norm.forward(k);
+        k = self.k_norm.forward(k);
 
-        let q = apply_mrope_simple(q, &cos, &sin);
-        let k = apply_mrope_simple(k, &cos, &sin);
+        let q = apply_mrope_simple(q, cos, sin);
+        let k_rot = apply_mrope_simple(k, cos, sin);
 
-        let k = repeat_kv(k, 2);
-        let v = repeat_kv(v, 2);
+        let (k_full, v_full) = if let Some(cache) = kv_cache {
+            (
+                Tensor::cat(vec![cache.k.clone(), k_rot.clone()], 2),
+                Tensor::cat(vec![cache.v.clone(), v.clone()], 2),
+            )
+        } else {
+            (k_rot.clone(), v.clone())
+        };
+
+        let n_rep = num_q_heads / num_kv_heads;
+        let new_cache = KvCacheEntry {
+            k: k_full.clone(),
+            v: v_full.clone(),
+        };
+        let k = repeat_kv(k_full, n_rep);
+        let v = repeat_kv(v_full, n_rep);
 
         let scale = (head_dim as f64).sqrt();
         let attn_weights = q.matmul(k.swap_dims(2, 3)).div_scalar(scale);
@@ -222,25 +311,19 @@ impl<B: Backend> Qwen3Attention<B> {
         let attn_output = attn_weights.matmul(v);
 
         let attn_output = attn_output.swap_dims(1, 2).reshape([batch, seq_len, num_q_heads * head_dim]);
-        self.o_proj.forward(attn_output)
+        (self.o_proj.forward(attn_output), new_cache)
     }
 }
 
-fn repeat_kv<B: Backend>(x: Tensor<B, 4>, n_rep: usize) -> Tensor<B, 4> {
-    if n_rep == 1 { return x; }
+pub fn repeat_kv<B: Backend>(x: Tensor<B, 4>, n_rep: usize) -> Tensor<B, 4> {
+    if n_rep == 1 {
+        return x;
+    }
     let [batch, num_kv_heads, seq_len, head_dim] = x.dims();
-    x.unsqueeze_dim::<5>(2).repeat_dim(2, n_rep)
+    x.unsqueeze_dim::<5>(2)
+        .repeat_dim(2, n_rep)
         .reshape([batch, num_kv_heads * n_rep, seq_len, head_dim])
 }
-
-fn make_positions<B: Backend>(seq_len: usize, device: &B::Device) -> Tensor<B, 2, Int> {
-    let vals: Vec<i32> = (0..seq_len as i32).collect();
-    Tensor::<B, 1, Int>::from_ints(vals.as_slice(), device).unsqueeze_dim::<2>(0)
-}
-
-// ============================================================
-// Qwen3 SwiGLU MLP (no biases in decoder Linear layers)
-// ============================================================
 
 #[derive(Module, Debug)]
 pub struct Qwen3MLP<B: Backend> {
@@ -258,10 +341,6 @@ impl<B: Backend> Qwen3MLP<B> {
     }
 }
 
-// ============================================================
-// Qwen3 Decoder Layer
-// ============================================================
-
 #[derive(Module, Debug)]
 pub struct Qwen3DecoderLayer<B: Backend> {
     pub input_layernorm: MyRmsNorm<B>,
@@ -274,24 +353,22 @@ impl<B: Backend> Qwen3DecoderLayer<B> {
     pub fn forward(
         &self,
         hidden_states: Tensor<B, 3>,
-        mrope: &MRoPE,
+        cos: &Tensor<B, 4>,
+        sin: &Tensor<B, 4>,
         causal_mask: Option<Tensor<B, 4, Bool>>,
-    ) -> Tensor<B, 3> {
+        kv_cache: Option<&KvCacheEntry<B>>,
+    ) -> (Tensor<B, 3>, KvCacheEntry<B>) {
         let residual = hidden_states.clone();
         let hidden_states = self.input_layernorm.forward(hidden_states);
-        let hidden_states = self.self_attn.forward(hidden_states, mrope, causal_mask);
+        let (hidden_states, new_cache) = self.self_attn.forward(hidden_states, cos, sin, causal_mask, kv_cache);
         let hidden_states = hidden_states.add(residual);
 
         let residual = hidden_states.clone();
         let hidden_states = self.post_attention_layernorm.forward(hidden_states);
         let hidden_states = self.mlp.forward(hidden_states);
-        hidden_states.add(residual)
+        (hidden_states.add(residual), new_cache)
     }
 }
-
-// ============================================================
-// Qwen3 Decoder
-// ============================================================
 
 #[derive(Module, Debug)]
 pub struct Qwen3Model<B: Backend> {
@@ -304,20 +381,31 @@ impl<B: Backend> Qwen3Model<B> {
     pub fn forward_embeds(
         &self,
         hidden_states: Tensor<B, 3>,
-        mrope: &MRoPE,
+        cos: &Tensor<B, 4>,
+        sin: &Tensor<B, 4>,
         causal_mask: Option<Tensor<B, 4, Bool>>,
+        kv_cache: Option<&mut KvCache<B>>,
     ) -> Tensor<B, 3> {
         let mut hidden_states = hidden_states;
-        for layer in &self.layers {
-            hidden_states = layer.forward(hidden_states, mrope, causal_mask.clone());
+        match kv_cache {
+            Some(cache) => {
+                for (index, layer) in self.layers.iter().enumerate() {
+                    let cached = cache.layer(index);
+                    let (next_hidden, new_cache) = layer.forward(hidden_states, cos, sin, causal_mask.clone(), cached);
+                    cache.set_layer(index, new_cache);
+                    hidden_states = next_hidden;
+                }
+            }
+            None => {
+                for layer in &self.layers {
+                    let (next_hidden, _) = layer.forward(hidden_states, cos, sin, causal_mask.clone(), None);
+                    hidden_states = next_hidden;
+                }
+            }
         }
         self.norm.forward(hidden_states)
     }
 }
-
-// ============================================================
-// Audio Encoder Attention
-// ============================================================
 
 #[derive(Module, Debug)]
 pub struct EncoderAttention<B: Backend> {
@@ -353,10 +441,6 @@ impl<B: Backend> EncoderAttention<B> {
     }
 }
 
-// ============================================================
-// Audio Encoder Layer
-// ============================================================
-
 #[derive(Module, Debug)]
 pub struct AudioEncoderLayer<B: Backend> {
     pub self_attn_layer_norm: MyLayerNorm<B>,
@@ -382,10 +466,6 @@ impl<B: Backend> AudioEncoderLayer<B> {
     }
 }
 
-// ============================================================
-// Audio Tower (layers directly, no encoder wrapper)
-// ============================================================
-
 #[derive(Module, Debug)]
 pub struct AudioTower<B: Backend> {
     pub conv2d1: Conv2d<B>,
@@ -400,47 +480,36 @@ pub struct AudioTower<B: Backend> {
 
 impl<B: Backend> AudioTower<B> {
     pub fn forward(&self, mel: Tensor<B, 3>) -> Tensor<B, 3> {
-        // Chunked convolution matching Python Qwen3ASRAudioEncoder:
-        // Split mel into chunks of n_window*2 = 100 frames, process each chunk
-        // independently through conv, then concatenate. This matches the Python
-        // chunking behavior which produces different output lengths due to per-chunk padding.
-        let [batch, _n_mels, mel_time] = mel.dims();
-        let chunk_size: usize = 100; // n_window * 2
+        let [_batch, _n_mels, mel_time] = mel.dims();
+        let chunk_size: usize = 100;
         let num_full_chunks = mel_time / chunk_size;
         let remainder = mel_time % chunk_size;
 
         let device = mel.device();
-
         let mut conv_outputs: Vec<Tensor<B, 3>> = Vec::new();
 
-        // Process full chunks
         for i in 0..num_full_chunks {
             let chunk = mel.clone().narrow(2, i * chunk_size, chunk_size);
             let out = self.conv_chunk(chunk);
             conv_outputs.push(out);
         }
-        // Process remainder chunk
         if remainder > 0 {
             let chunk = mel.narrow(2, num_full_chunks * chunk_size, remainder);
             let out = self.conv_chunk(chunk);
             conv_outputs.push(out);
         }
 
-        // Concatenate all chunk outputs along time dimension
         let mut x = if conv_outputs.len() == 1 {
             conv_outputs.remove(0)
         } else {
             Tensor::cat(conv_outputs, 1)
         };
 
-        // Add sinusoidal positional embedding
         let time = x.dims()[1];
         let d_model = x.dims()[2];
         let pos_emb = sinusoidal_position_embedding::<B>(time, d_model, &device);
         x = x + pos_emb;
 
-        // Encoder layers with full self-attention (no chunk masking needed
-        // since our audio is short enough to fit in one attention group)
         for layer in &self.layers {
             x = layer.forward(x);
         }
@@ -450,7 +519,6 @@ impl<B: Backend> AudioTower<B> {
         self.proj2.forward(x)
     }
 
-    /// Process a single mel chunk through the conv layers and conv_out projection.
     fn conv_chunk(&self, chunk: Tensor<B, 3>) -> Tensor<B, 3> {
         let x = chunk.unsqueeze_dim::<4>(1);
         let x = burn::tensor::activation::gelu(self.conv2d1.forward(x));
@@ -468,13 +536,11 @@ fn sinusoidal_position_embedding<B: Backend>(length: usize, channels: usize, dev
     let half_channels = channels / 2;
     let mut emb = Vec::with_capacity(length * channels);
     for pos in 0..length {
-        // First half: all sin values (matches Python torch.cat([sin, cos]))
         for i in 0..half_channels {
             let inv_timescale = (-log_timescale_increment * i as f64).exp();
             let scaled_time = pos as f64 * inv_timescale;
             emb.push(scaled_time.sin() as f32);
         }
-        // Second half: all cos values
         for i in 0..half_channels {
             let inv_timescale = (-log_timescale_increment * i as f64).exp();
             let scaled_time = pos as f64 * inv_timescale;
@@ -485,10 +551,6 @@ fn sinusoidal_position_embedding<B: Backend>(length: usize, channels: usize, dev
         .reshape([length, channels])
         .unsqueeze_dim::<3>(0)
 }
-
-// ============================================================
-// Thinker + Top-level wrapper
-// ============================================================
 
 #[derive(Module, Debug)]
 pub struct Thinker<B: Backend> {
@@ -501,10 +563,6 @@ pub struct Thinker<B: Backend> {
 pub struct Qwen3ASR<B: Backend> {
     pub thinker: Thinker<B>,
 }
-
-// ============================================================
-// Config
-// ============================================================
 
 pub struct Qwen3ASRConfig {
     pub audio_config: AudioEncoderConfig,
@@ -521,7 +579,7 @@ impl Qwen3ASRConfig {
         let ffn = self.audio_config.encoder_ffn_dim;
         let ds = self.audio_config.downsample_hidden_size;
         let num_mel_bins = self.audio_config.num_mel_bins;
-        let conv_freq_bins = ((((num_mel_bins + 1) / 2 + 1) / 2 + 1) / 2);
+        let conv_freq_bins = (((num_mel_bins + 1) / 2 + 1) / 2 + 1) / 2;
         let conv_out_dim = ds * conv_freq_bins;
         let eps = self.text_config.rms_norm_eps;
 
@@ -603,23 +661,24 @@ impl Qwen3ASRConfig {
     }
 }
 
-// ============================================================
-// Helpers
-// ============================================================
-
 pub fn create_mrope(text_config: &TextConfig) -> MRoPE {
-    let mrope_section = text_config.rope_scaling.as_ref()
-        .and_then(|rs| if rs.mrope_section.is_empty() { None } else { Some(rs.mrope_section.clone()) })
-        .unwrap_or_else(|| vec![24, 20, 20]);
-    MRoPE::new(text_config.head_dim, text_config.rope_theta, &mrope_section)
+    MRoPE::new(
+        text_config.head_dim,
+        text_config.rope_theta,
+        &text_config.mrope_section(),
+        text_config.mrope_interleaved(),
+    )
 }
 
-pub fn create_causal_mask<B: Backend>(seq_len: usize, device: &B::Device) -> Tensor<B, 4, Bool> {
-    // Create upper triangular mask (True = masked/blocked, i.e., j > i)
-    // Start with ones, then triu(1) keeps ones above diagonal, zeros below
-    let mask: Tensor<B, 2> = Tensor::ones([seq_len, seq_len], device);
-    let mask = mask.triu(1); // keep elements above diagonal (j > i)
-    let mask: Tensor<B, 2, Bool> = mask.equal_elem(1.0f64);
-    let mask: Tensor<B, 3, Bool> = mask.unsqueeze_dim::<3>(0);
-    mask.unsqueeze_dim::<4>(0)
+pub fn create_causal_mask<B: Backend>(seq_len: usize, past_len: usize, device: &B::Device) -> Tensor<B, 4, Bool> {
+    let total_len = past_len + seq_len;
+    let mut values = Vec::with_capacity(seq_len * total_len);
+    for row in 0..seq_len {
+        let current_pos = past_len + row;
+        for col in 0..total_len {
+            values.push(col > current_pos);
+        }
+    }
+    let mask = Tensor::<B, 1, Bool>::from_bool(values.as_slice().into(), device).reshape([seq_len, total_len]);
+    mask.unsqueeze_dim::<3>(0).unsqueeze_dim::<4>(0)
 }

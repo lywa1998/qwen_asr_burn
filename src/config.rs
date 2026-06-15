@@ -75,6 +75,22 @@ pub struct GenerationConfig {
     pub temperature: f64,
 }
 
+impl TextConfig {
+    pub fn mrope_section(&self) -> Vec<usize> {
+        self.rope_scaling
+            .as_ref()
+            .and_then(|rope| (!rope.mrope_section.is_empty()).then(|| rope.mrope_section.clone()))
+            .unwrap_or_else(|| vec![24, 20, 20])
+    }
+
+    pub fn mrope_interleaved(&self) -> bool {
+        self.rope_scaling
+            .as_ref()
+            .map(|rope| rope.mrope_interleaved.unwrap_or(false) || rope.interleaved.unwrap_or(false))
+            .unwrap_or(true)
+    }
+}
+
 impl ModelConfig {
     pub fn from_dir(model_dir: &str) -> anyhow::Result<Self> {
         let path = format!("{}/config.json", model_dir);

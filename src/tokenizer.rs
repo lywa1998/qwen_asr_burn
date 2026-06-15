@@ -30,11 +30,7 @@ impl Qwen2Tokenizer {
         tokenizer.with_pre_tokenizer(Some(ByteLevel::default()));
         tokenizer.with_decoder(Some(ByteLevelDecoder::default()));
 
-        // Add special tokens with settings matching Python tokenizer_config.json.
-        // CRITICAL: single_word=false so tokens do NOT create word boundaries
-        // (ByteLevel won't add leading spaces after them)
         let special_tokens: Vec<(&str, bool, bool)> = vec![
-            // (content, is_special, is_single_word)
             ("<|endoftext|>", true, false),
             ("<|im_start|>", true, false),
             ("<|im_end|>", true, false),
@@ -113,13 +109,12 @@ impl Qwen2Tokenizer {
         let count = tokenizer.add_special_tokens(&added_tokens);
         log::info!("Added {} special tokens", count);
 
-        // Get token IDs
-        let audio_pad_id = tokenizer.token_to_id("<|audio_pad|>").unwrap_or(0);
-        let audio_start_id = tokenizer.token_to_id("<|audio_start|>").unwrap_or(0);
-        let audio_end_id = tokenizer.token_to_id("<|audio_end|>").unwrap_or(0);
-        let im_start_id = tokenizer.token_to_id("<|im_start|>").unwrap_or(0);
-        let im_end_id = tokenizer.token_to_id("<|im_end|>").unwrap_or(0);
-        let eos_id = tokenizer.token_to_id("<|endoftext|>").unwrap_or(0);
+        let audio_pad_id = required_token_id(&tokenizer, "<|audio_pad|>")?;
+        let audio_start_id = required_token_id(&tokenizer, "<|audio_start|>")?;
+        let audio_end_id = required_token_id(&tokenizer, "<|audio_end|>")?;
+        let im_start_id = required_token_id(&tokenizer, "<|im_start|>")?;
+        let im_end_id = required_token_id(&tokenizer, "<|im_end|>")?;
+        let eos_id = required_token_id(&tokenizer, "<|endoftext|>")?;
 
         log::info!("Audio tokens: start={audio_start_id}, end={audio_end_id}, pad={audio_pad_id}");
         log::info!("Chat tokens: im_start={im_start_id}, im_end={im_end_id}, eos={eos_id}");
@@ -136,11 +131,6 @@ impl Qwen2Tokenizer {
     }
 
     pub fn encode(&self, text: &str) -> Vec<u32> {
-        // HuggingFace tokenizer handles special tokens differently from the tokenizers crate:
-        // special tokens with single_word=false don't create word boundaries,
-        // so subsequent text doesn't get ByteLevel leading spaces.
-        // We implement this by splitting text at special token positions and encoding
-        // each segment separately.
         let special_tokens: &[&str] = &[
             "<|endoftext|>", "<|im_start|>", "<|im_end|>",
             "<|object_ref_start|>", "<|object_ref_end|>",
@@ -164,7 +154,6 @@ impl Qwen2Tokenizer {
             "<blank26>", "<blank27>", "<asr_text>",
         ];
 
-        // Find all special token occurrences and their positions
         let mut positions: Vec<(usize, usize, u32)> = Vec::new();
         for token_str in special_tokens {
             let token_id = match self.tokenizer.token_to_id(token_str) {
@@ -180,40 +169,22 @@ impl Qwen2Tokenizer {
         }
         positions.sort_by_key(|(s, _, _)| *s);
 
-        // Remove overlapping (shorter tokens that are inside longer ones)
         let mut filtered: Vec<(usize, usize, u32)> = Vec::new();
         for (s, e, id) in positions {
-            // Check if any already-added token overlaps with this one
-            let overlaps = filtered.iter().any(|(fs, fe, _)| {
-                !(e <= *fs || s >= *fe) // overlap check
-            });
+            let overlaps = filtered.iter().any(|(fs, fe, _)| !(e <= *fs || s >= *fe));
             if !overlaps {
                 filtered.push((s, e, id));
             }
         }
 
-        // Split text at token boundaries and encode segments.
-        // ByteLevel adds a leading space to each segment start, but HuggingFace
-        // doesn't add spaces after special tokens. We fix this by mapping
-        // space-prefixed first tokens back to non-space versions.
-        // Build a map: space_prefixed_token_id -> non_space_token_id
         let mut space_map: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
-        // After a special token, the first character doesn't get a ByteLevel space.
-        // We can detect this by encoding with and without a leading space.
-        // Strategy: for segments after special tokens, strip the ByteLevel space
-        // by re-encoding with the segment's first character explicitly.
-
         let mut result: Vec<u32> = Vec::new();
         let mut cursor = 0;
         for (start, end, token_id) in &filtered {
-            // Encode text segment before this token
             if cursor < *start {
                 let segment = &text[cursor..*start];
                 if let Ok(encoding) = self.tokenizer.encode(segment, false) {
                     let mut ids: Vec<u32> = encoding.get_ids().to_vec();
-                    // ByteLevel adds a leading space to first token of EVERY segment.
-                    // HuggingFace never produces this space prefix.
-                    // Fix: remap space-prefixed first tokens to their non-space version.
                     if !ids.is_empty() {
                         let first_id = ids[0];
                         if let Some(&fixed_id) = space_map.get(&first_id) {
@@ -237,11 +208,9 @@ impl Qwen2Tokenizer {
                     result.extend_from_slice(&ids);
                 }
             }
-            // Add the special token
             result.push(*token_id);
             cursor = *end;
         }
-        // Encode remaining text
         if cursor < text.len() {
             let segment = &text[cursor..];
             if let Ok(encoding) = self.tokenizer.encode(segment, false) {
@@ -257,7 +226,6 @@ impl Qwen2Tokenizer {
         }
 
         if result.is_empty() {
-            // Fallback: do a regular encode
             match self.tokenizer.encode(text, false) {
                 Ok(encoding) => encoding.get_ids().iter().map(|&id| id).collect(),
                 Err(e) => {
@@ -280,4 +248,10 @@ impl Qwen2Tokenizer {
             }
         }
     }
+}
+
+fn required_token_id(tokenizer: &Tokenizer, token: &str) -> anyhow::Result<u32> {
+    tokenizer
+        .token_to_id(token)
+        .ok_or_else(|| anyhow::anyhow!("missing required special token: {}", token))
 }

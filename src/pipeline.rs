@@ -3,7 +3,7 @@ use burn::tensor::{Int, Tensor};
 
 use crate::audio::MelSpectrogram;
 use crate::config::{GenerationConfig, ModelConfig, PreprocessorConfig};
-use crate::model::{self, create_mrope, Qwen3ASR, Qwen3ASRConfig};
+use crate::model::{self, create_mrope, KvCache, Qwen3ASR, Qwen3ASRConfig};
 use crate::tokenizer::Qwen2Tokenizer;
 
 pub struct AsrPipeline<B: Backend> {
@@ -13,8 +13,9 @@ pub struct AsrPipeline<B: Backend> {
     mrope: model::MRoPE,
     device: B::Device,
     eos_token_ids: Vec<u32>,
-    audio_pad: u32,
-    audio_end: u32,
+    audio_start_token_id: u32,
+    audio_end_token_id: u32,
+    audio_token_id: u32,
 }
 
 impl<B: Backend> AsrPipeline<B> {
@@ -32,12 +33,10 @@ impl<B: Backend> AsrPipeline<B> {
         let weights_path = format!("{}/model.safetensors", model_dir);
         {
             use burn_store::{ModuleSnapshot, PyTorchToBurnAdapter, SafetensorsStore};
-            let mut store =
-                SafetensorsStore::from_file(&weights_path)
-                    .with_from_adapter(PyTorchToBurnAdapter);
+            let mut store = SafetensorsStore::from_file(&weights_path)
+                .with_from_adapter(PyTorchToBurnAdapter);
             let result = m.load_from(&mut store)?;
-            log::info!("Weight loading: {} applied, {} errors",
-                result.applied.len(), result.errors.len());
+            log::info!("Weight loading: {} applied, {} errors", result.applied.len(), result.errors.len());
         }
 
         let tokenizer = Qwen2Tokenizer::from_dir(model_dir)?;
@@ -49,8 +48,6 @@ impl<B: Backend> AsrPipeline<B> {
         );
         let mrope = create_mrope(&text_config);
 
-        let audio_pad = tokenizer.audio_pad;
-        let audio_end = tokenizer.audio_end;
         Ok(Self {
             model: m,
             tokenizer,
@@ -58,15 +55,15 @@ impl<B: Backend> AsrPipeline<B> {
             mrope,
             device,
             eos_token_ids: generation_config.eos_token_id,
-            audio_pad,
-            audio_end,
+            audio_start_token_id: model_config.thinker_config.audio_start_token_id,
+            audio_end_token_id: model_config.thinker_config.audio_end_token_id,
+            audio_token_id: model_config.thinker_config.audio_token_id,
         })
     }
 
     pub fn transcribe(&self, wav_path: &str) -> anyhow::Result<String> {
         log::info!("Loading audio: {}", wav_path);
 
-        // 1. Mel spectrogram → audio encoder
         let mel_spec = self.mel_extractor.compute_from_wav(wav_path)?;
         let n_mels = mel_spec.len();
         let n_frames = mel_spec[0].len();
@@ -84,7 +81,6 @@ impl<B: Backend> AsrPipeline<B> {
         let [_, audio_len, feat_dim] = audio_features.dims();
         log::info!("Audio encoder output: {audio_len} tokens, dim={feat_dim}");
 
-        // Check feature statistics
         let feat_flat = audio_features.clone().flatten::<1>(0, 2);
         let feat_data = feat_flat.into_data();
         let n_floats = feat_data.bytes.len() / 4;
@@ -109,7 +105,6 @@ impl<B: Backend> AsrPipeline<B> {
         let std = (sum_sq / n - mean * mean).sqrt();
         log::info!("Audio features stats: mean={mean:.4}, std={std:.4}, range=[{lo:.4}, {hi:.4}]");
 
-        // Debug: check if features have reasonable values
         let feat_data = audio_features.clone().flatten::<1>(0, 2).into_data();
         let bytes = &feat_data.bytes;
         if bytes.len() >= 4 {
@@ -123,55 +118,37 @@ impl<B: Backend> AsrPipeline<B> {
             log::info!("Audio features: first={f0:.4}, last={fn_:.4}");
         }
 
-        // 2. Build prompt with exact Python-matching token IDs
-        // Prefix: "<|im_start|>system\n<|im_end|>\n<|im_start|>user\n<|audio_start|>"
-        // Python token IDs: [151644, 8948, 198, 151645, 198, 151644, 872, 198, 151669]
-        let prefix_ids = vec![151644u32, 8948, 198, 151645, 198, 151644, 872, 198, 151669];
-        // Suffix: "<|audio_end|><|im_end|>\n<|im_start|>assistant\n"
-        // Python token IDs: [151670, 151645, 198, 151644, 77091, 198]
-        let suffix_ids = vec![151670u32, 151645, 198, 151644, 77091, 198];
-
-        // 3. Embeddings: prefix + audio_features + suffix
+        let prefix_ids = self.build_prefix_ids();
+        let suffix_ids = self.build_suffix_ids();
         let prefix_ids_tensor = int_tensor_2d::<B>(&prefix_ids, &self.device);
         let suffix_ids_tensor = int_tensor_2d::<B>(&suffix_ids, &self.device);
 
-        let prefix_embeds = self
-            .model
-            .thinker
-            .model
-            .embed_tokens
-            .forward(prefix_ids_tensor);
-        let suffix_embeds = self
-            .model
-            .thinker
-            .model
-            .embed_tokens
-            .forward(suffix_ids_tensor);
+        let prefix_embeds = self.model.thinker.model.embed_tokens.forward(prefix_ids_tensor);
+        let suffix_embeds = self.model.thinker.model.embed_tokens.forward(suffix_ids_tensor);
+        let current_embeds = Tensor::cat(vec![prefix_embeds, audio_features, suffix_embeds], 1);
 
-        let mut current_embeds = Tensor::cat(vec![prefix_embeds, audio_features, suffix_embeds], 1);
-
-        // 4. Autoregressive generation
         let max_new = 256;
+        let seq_len = current_embeds.dims()[1];
+        let total_positions: Vec<usize> = (0..(seq_len + max_new)).collect();
+        let mut kv_cache = KvCache::new(self.model.thinker.model.layers.len());
+        let (prefill_cos, prefill_sin) = self
+            .mrope
+            .compute_cos_sin_from_positions(&total_positions[..seq_len], &self.device);
+        let causal_mask = model::create_causal_mask::<B>(seq_len, 0, &self.device);
+        let hidden_states = self.model.thinker.model.forward_embeds(
+            current_embeds,
+            &prefill_cos,
+            &prefill_sin,
+            Some(causal_mask),
+            Some(&mut kv_cache),
+        );
+        let logits = self.model.thinker.lm_head.forward(hidden_states);
+        let vocab_size = logits.dims()[2];
+        let mut last_logits = logits.narrow(1, seq_len - 1, 1).reshape([1, vocab_size]);
+
         let mut generated: Vec<u32> = Vec::new();
-
+        let mut current_pos = seq_len;
         for step in 0..max_new {
-            let seq_len = current_embeds.dims()[1];
-            let causal_mask = model::create_causal_mask::<B>(seq_len, &self.device);
-
-            let hidden_states = self.model.thinker.model.forward_embeds(
-                current_embeds.clone(),
-                &self.mrope,
-                Some(causal_mask),
-            );
-
-            let logits = self.model.thinker.lm_head.forward(hidden_states);
-            let vocab_size = logits.dims()[2];
-            if step == 0 {
-                log::info!("First step, seq_len={seq_len}");
-            }
-            let last_logits = logits.narrow(1, seq_len - 1, 1).reshape([1, vocab_size]);
-
-            // Greedy: argmax
             let token_data = last_logits.argmax(1).reshape([1]).into_data();
             let next_token_id = i32::from_le_bytes([
                 token_data.bytes[0],
@@ -180,16 +157,28 @@ impl<B: Backend> AsrPipeline<B> {
                 token_data.bytes[3],
             ]) as u32;
 
-            if self.eos_token_ids.contains(&next_token_id) {
+            if self.eos_token_ids.contains(&next_token_id) || next_token_id == self.tokenizer.im_end {
                 log::info!("EOS token {next_token_id} at step {step}");
                 break;
             }
 
             generated.push(next_token_id);
-
             let next_ids = int_tensor_2d::<B>(&[next_token_id], &self.device);
             let next_embed = self.model.thinker.model.embed_tokens.forward(next_ids);
-            current_embeds = Tensor::cat(vec![current_embeds, next_embed], 1);
+            let (step_cos, step_sin) = self
+                .mrope
+                .compute_cos_sin_from_positions(&[current_pos], &self.device);
+            let step_mask = model::create_causal_mask::<B>(1, kv_cache.seq_len(), &self.device);
+            let hidden_states = self.model.thinker.model.forward_embeds(
+                next_embed,
+                &step_cos,
+                &step_sin,
+                Some(step_mask),
+                Some(&mut kv_cache),
+            );
+            let logits = self.model.thinker.lm_head.forward(hidden_states);
+            last_logits = logits.reshape([1, vocab_size]);
+            current_pos += 1;
 
             if step < 3 {
                 let raw = &token_data.bytes;
@@ -204,6 +193,28 @@ impl<B: Backend> AsrPipeline<B> {
         let text = self.tokenizer.decode(&generated);
         log::info!("Generated {} tokens, text: {}", generated.len(), text);
         Ok(text.trim().to_string())
+    }
+
+    fn build_prefix_ids(&self) -> Vec<u32> {
+        let mut prefix_ids = vec![self.tokenizer.im_start];
+        prefix_ids.extend(self.tokenizer.encode("system\n"));
+        prefix_ids.push(self.tokenizer.im_end);
+        prefix_ids.extend(self.tokenizer.encode("\n"));
+        prefix_ids.push(self.tokenizer.im_start);
+        prefix_ids.extend(self.tokenizer.encode("user\n"));
+        prefix_ids.push(self.audio_start_token_id);
+        prefix_ids
+    }
+
+    fn build_suffix_ids(&self) -> Vec<u32> {
+        let mut suffix_ids = vec![self.audio_end_token_id, self.tokenizer.im_end];
+        suffix_ids.extend(self.tokenizer.encode("\nassistant\n"));
+        suffix_ids
+    }
+
+    #[allow(dead_code)]
+    fn build_audio_token_ids(&self, audio_len: usize) -> Vec<u32> {
+        std::iter::repeat_n(self.audio_token_id, audio_len).collect()
     }
 }
 
