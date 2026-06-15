@@ -28,15 +28,19 @@ impl<B: Backend> AsrPipeline<B> {
         let text_config = model_config.thinker_config.text_config.clone();
 
         let burn_config = Qwen3ASRConfig::new(audio_config, text_config.clone());
-        let mut m = burn_config.init(&device);
+        let mut model = burn_config.init(&device);
 
         let weights_path = format!("{}/model.safetensors", model_dir);
         {
             use burn_store::{ModuleSnapshot, PyTorchToBurnAdapter, SafetensorsStore};
-            let mut store = SafetensorsStore::from_file(&weights_path)
-                .with_from_adapter(PyTorchToBurnAdapter);
-            let result = m.load_from(&mut store)?;
-            log::info!("Weight loading: {} applied, {} errors", result.applied.len(), result.errors.len());
+            let mut store =
+                SafetensorsStore::from_file(&weights_path).with_from_adapter(PyTorchToBurnAdapter);
+            let result = model.load_from(&mut store)?;
+            log::info!(
+                "Weight loading: {} applied, {} errors",
+                result.applied.len(),
+                result.errors.len()
+            );
         }
 
         let tokenizer = Qwen2Tokenizer::from_dir(model_dir)?;
@@ -49,7 +53,7 @@ impl<B: Backend> AsrPipeline<B> {
         let mrope = create_mrope(&text_config);
 
         Ok(Self {
-            model: m,
+            model,
             tokenizer,
             mel_extractor,
             mrope,
@@ -123,8 +127,18 @@ impl<B: Backend> AsrPipeline<B> {
         let prefix_ids_tensor = int_tensor_2d::<B>(&prefix_ids, &self.device);
         let suffix_ids_tensor = int_tensor_2d::<B>(&suffix_ids, &self.device);
 
-        let prefix_embeds = self.model.thinker.model.embed_tokens.forward(prefix_ids_tensor);
-        let suffix_embeds = self.model.thinker.model.embed_tokens.forward(suffix_ids_tensor);
+        let prefix_embeds = self
+            .model
+            .thinker
+            .model
+            .embed_tokens
+            .forward(prefix_ids_tensor);
+        let suffix_embeds = self
+            .model
+            .thinker
+            .model
+            .embed_tokens
+            .forward(suffix_ids_tensor);
         let current_embeds = Tensor::cat(vec![prefix_embeds, audio_features, suffix_embeds], 1);
 
         let max_new = 256;
@@ -157,7 +171,8 @@ impl<B: Backend> AsrPipeline<B> {
                 token_data.bytes[3],
             ]) as u32;
 
-            if self.eos_token_ids.contains(&next_token_id) || next_token_id == self.tokenizer.im_end {
+            if self.eos_token_ids.contains(&next_token_id) || next_token_id == self.tokenizer.im_end
+            {
                 log::info!("EOS token {next_token_id} at step {step}");
                 break;
             }

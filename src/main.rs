@@ -1,16 +1,22 @@
+#![feature(iterator_try_collect)]
+
 mod audio;
 mod config;
 mod model;
 mod pipeline;
 mod tokenizer;
 
-use burn::backend::Cuda;
+use burn::backend::{cuda::CudaDevice, Cuda};
 use burn::tensor::bf16;
 use clap::Parser;
 use pipeline::AsrPipeline;
 
 #[derive(Parser)]
-#[command(name = "qwen-asr", version, about = "Qwen3-ASR with Burn + CUDA (BF16)")]
+#[command(
+    name = "qwen-asr",
+    version,
+    about = "Qwen3-ASR with Burn + CUDA (BF16)"
+)]
 struct Cli {
     #[arg(short, long, default_value = "Qwen3-ASR-0.6B")]
     model_dir: String,
@@ -35,7 +41,7 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     log::info!("Initializing Qwen3-ASR with CUDA backend...");
-    let device = burn::backend::cuda::CudaDevice::default();
+    let device = CudaDevice::default();
     let pipeline = AsrPipeline::<Backend>::new(&cli.model_dir, device)?;
 
     match cli.command {
