@@ -1,9 +1,8 @@
+use burn::config::Config;
 use burn::module::{Module, Param};
-use burn::nn::{
-    conv::Conv2dConfig, EmbeddingConfig, LinearConfig,
-};
 use burn::nn::conv::Conv2d;
 use burn::nn::PaddingConfig2d;
+use burn::nn::{conv::Conv2dConfig, EmbeddingConfig, LinearConfig};
 use burn::nn::{Embedding, Linear};
 use burn::tensor::backend::Backend;
 use burn::tensor::{Bool, Int, Tensor};
@@ -17,14 +16,34 @@ pub struct MyRmsNorm<B: Backend> {
     epsilon: f64,
 }
 
-impl<B: Backend> MyRmsNorm<B> {
-    pub fn new(d_model: usize, epsilon: f64, device: &B::Device) -> Self {
-        Self { weight: Param::from_tensor(Tensor::ones([d_model], device)), epsilon }
-    }
+#[derive(Config, Debug)]
+pub struct MyRmsNormConfig {
+    d_model: usize,
+    epsilon: f64,
+}
 
+impl MyRmsNormConfig {
+    pub fn init<B: Backend>(&self, device: &B::Device) -> MyRmsNorm<B> {
+        MyRmsNorm {
+            weight: Param::from_tensor(Tensor::ones([self.d_model], device)),
+            epsilon: self.epsilon,
+        }
+    }
+}
+
+impl<B: Backend> MyRmsNorm<B> {
     pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
-        let rms = x.clone().powf_scalar(2.0).mean_dim(2).add_scalar(self.epsilon).sqrt();
-        let w = self.weight.val().unsqueeze_dim::<2>(0).unsqueeze_dim::<3>(1);
+        let rms = x
+            .clone()
+            .powf_scalar(2.0)
+            .mean_dim(2)
+            .add_scalar(self.epsilon)
+            .sqrt();
+        let w = self
+            .weight
+            .val()
+            .unsqueeze_dim::<2>(0)
+            .unsqueeze_dim::<3>(1);
         x.div(rms).mul(w)
     }
 }
@@ -37,22 +56,38 @@ pub struct MyLayerNorm<B: Backend> {
     epsilon: f64,
 }
 
-impl<B: Backend> MyLayerNorm<B> {
-    pub fn new(d_model: usize, epsilon: f64, device: &B::Device) -> Self {
-        Self {
-            weight: Param::from_tensor(Tensor::ones([d_model], device)),
-            bias: Param::from_tensor(Tensor::zeros([d_model], device)),
-            epsilon,
+#[derive(Config, Debug)]
+pub struct MyLayerNormConfig {
+    d_model: usize,
+    epsilon: f64,
+}
+
+impl MyLayerNormConfig {
+    pub fn init<B: Backend>(&self, device: &B::Device) -> MyLayerNorm<B> {
+        MyLayerNorm {
+            weight: Param::from_tensor(Tensor::ones([self.d_model], device)),
+            bias: Param::from_tensor(Tensor::zeros([self.d_model], device)),
+            epsilon: self.epsilon,
         }
     }
+}
 
+impl<B: Backend> MyLayerNorm<B> {
     pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
         let ndim = 3;
         let mean = x.clone().mean_dim(ndim - 1);
-        let var = x.clone().sub(mean.clone()).powf_scalar(2.0).mean_dim(ndim - 1);
+        let var = x
+            .clone()
+            .sub(mean.clone())
+            .powf_scalar(2.0)
+            .mean_dim(ndim - 1);
         let x_norm = x.sub(mean).div(var.add_scalar(self.epsilon).sqrt());
 
-        let w = self.weight.val().unsqueeze_dim::<2>(0).unsqueeze_dim::<3>(1);
+        let w = self
+            .weight
+            .val()
+            .unsqueeze_dim::<2>(0)
+            .unsqueeze_dim::<3>(1);
         let b = self.bias.val().unsqueeze_dim::<2>(0).unsqueeze_dim::<3>(1);
         x_norm.mul(w).add(b)
     }
@@ -60,22 +95,21 @@ impl<B: Backend> MyLayerNorm<B> {
 
 pub struct MRoPE {
     inv_freq: Vec<f32>,
-    dim_map: Vec<usize>,
     head_dim: usize,
 }
 
 impl MRoPE {
-    pub fn new(head_dim: usize, rope_theta: f64, mrope_section: &[usize], interleaved: bool) -> Self {
+    pub fn new(
+        head_dim: usize,
+        rope_theta: f64,
+        _mrope_section: &[usize],
+        _interleaved: bool,
+    ) -> Self {
         let half_dim = head_dim / 2;
         let inv_freq = (0..half_dim)
             .map(|i| (1.0 / rope_theta.powf(2.0 * i as f64 / head_dim as f64)) as f32)
             .collect();
-        let dim_map = if interleaved {
-            build_interleaved_dim_map(mrope_section, half_dim)
-        } else {
-            build_contiguous_dim_map(mrope_section, half_dim)
-        };
-        Self { inv_freq, dim_map, head_dim }
+        Self { inv_freq, head_dim }
     }
 
     pub fn compute_cos_sin<B: Backend>(
@@ -123,53 +157,10 @@ impl MRoPE {
         device: &B::Device,
     ) -> (Tensor<B, 4>, Tensor<B, 4>) {
         let ids: Vec<i32> = positions.iter().map(|&pos| pos as i32).collect();
-        let position_ids = Tensor::<B, 1, Int>::from_ints(ids.as_slice(), device).unsqueeze_dim::<2>(0);
+        let position_ids =
+            Tensor::<B, 1, Int>::from_ints(ids.as_slice(), device).unsqueeze_dim::<2>(0);
         self.compute_cos_sin(position_ids)
     }
-}
-
-fn build_contiguous_dim_map(sections: &[usize], total: usize) -> Vec<usize> {
-    let mut map = Vec::with_capacity(total);
-    for (dim, &size) in sections.iter().enumerate() {
-        for _ in 0..size {
-            if map.len() >= total {
-                break;
-            }
-            map.push(dim);
-        }
-    }
-    while map.len() < total {
-        map.push(sections.len().saturating_sub(1));
-    }
-    map
-}
-
-fn build_interleaved_dim_map(sections: &[usize], total: usize) -> Vec<usize> {
-    let n_dims = sections.len().max(1);
-    let mut map = Vec::with_capacity(total);
-    let mut counts = vec![0usize; n_dims];
-
-    while map.len() < total {
-        let prev_len = map.len();
-        for dim in 0..n_dims {
-            if map.len() >= total {
-                break;
-            }
-            let limit = sections.get(dim).copied().unwrap_or(0);
-            if counts[dim] < limit {
-                map.push(dim);
-                counts[dim] += 1;
-            }
-        }
-        if map.len() == prev_len {
-            break;
-        }
-    }
-
-    while map.len() < total {
-        map.push(n_dims - 1);
-    }
-    map
 }
 
 fn apply_mrope_simple<B: Backend>(
@@ -193,10 +184,35 @@ pub struct QKNorm<B: Backend> {
     epsilon: f64,
 }
 
+#[derive(Config, Debug)]
+pub struct QKNormConfig {
+    head_dim: usize,
+    epsilon: f64,
+}
+
+impl QKNormConfig {
+    pub fn init<B: Backend>(&self, device: &B::Device) -> QKNorm<B> {
+        QKNorm {
+            weight: Param::from_tensor(Tensor::ones([self.head_dim], device)),
+            epsilon: self.epsilon,
+        }
+    }
+}
+
 impl<B: Backend> QKNorm<B> {
     pub fn forward(&self, x: Tensor<B, 4>) -> Tensor<B, 4> {
-        let rms = x.clone().powf_scalar(2.0).mean_dim(3).add_scalar(self.epsilon).sqrt();
-        let w = self.weight.val().unsqueeze_dim::<2>(0).unsqueeze_dim::<3>(1).unsqueeze_dim::<4>(2);
+        let rms = x
+            .clone()
+            .powf_scalar(2.0)
+            .mean_dim(3)
+            .add_scalar(self.epsilon)
+            .sqrt();
+        let w = self
+            .weight
+            .val()
+            .unsqueeze_dim::<2>(0)
+            .unsqueeze_dim::<3>(1)
+            .unsqueeze_dim::<4>(2);
         x.div(rms).mul(w)
     }
 }
@@ -253,6 +269,39 @@ pub struct Qwen3Attention<B: Backend> {
     head_dim: usize,
 }
 
+#[derive(Config, Debug)]
+pub struct Qwen3AttentionConfig {
+    hidden_size: usize,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    epsilon: f64,
+}
+
+impl Qwen3AttentionConfig {
+    pub fn init<B: Backend>(&self, device: &B::Device) -> Qwen3Attention<B> {
+        Qwen3Attention {
+            q_proj: LinearConfig::new(self.hidden_size, self.num_q_heads * self.head_dim)
+                .with_bias(false)
+                .init(device),
+            k_proj: LinearConfig::new(self.hidden_size, self.num_kv_heads * self.head_dim)
+                .with_bias(false)
+                .init(device),
+            v_proj: LinearConfig::new(self.hidden_size, self.num_kv_heads * self.head_dim)
+                .with_bias(false)
+                .init(device),
+            o_proj: LinearConfig::new(self.num_q_heads * self.head_dim, self.hidden_size)
+                .with_bias(false)
+                .init(device),
+            q_norm: QKNormConfig::new(self.head_dim, self.epsilon).init(device),
+            k_norm: QKNormConfig::new(self.head_dim, self.epsilon).init(device),
+            num_q_heads: self.num_q_heads,
+            num_kv_heads: self.num_kv_heads,
+            head_dim: self.head_dim,
+        }
+    }
+}
+
 impl<B: Backend> Qwen3Attention<B> {
     pub fn forward(
         &self,
@@ -271,12 +320,18 @@ impl<B: Backend> Qwen3Attention<B> {
         let k = self.k_proj.forward(hidden_states.clone());
         let v = self.v_proj.forward(hidden_states);
 
-        let q = q.reshape([batch, seq_len, num_q_heads, head_dim]).swap_dims(1, 2);
-        let mut k = k.reshape([batch, seq_len, num_kv_heads, head_dim]).swap_dims(1, 2);
-        let mut v = v.reshape([batch, seq_len, num_kv_heads, head_dim]).swap_dims(1, 2);
+        let q = q
+            .reshape([batch, seq_len, num_q_heads, head_dim])
+            .swap_dims(1, 2);
+        let k = k
+            .reshape([batch, seq_len, num_kv_heads, head_dim])
+            .swap_dims(1, 2);
+        let v = v
+            .reshape([batch, seq_len, num_kv_heads, head_dim])
+            .swap_dims(1, 2);
 
         let q = self.q_norm.forward(q);
-        k = self.k_norm.forward(k);
+        let k = self.k_norm.forward(k);
 
         let q = apply_mrope_simple(q, cos, sin);
         let k_rot = apply_mrope_simple(k, cos, sin);
@@ -310,7 +365,10 @@ impl<B: Backend> Qwen3Attention<B> {
         let attn_weights = burn::tensor::activation::softmax(attn_weights, 3);
         let attn_output = attn_weights.matmul(v);
 
-        let attn_output = attn_output.swap_dims(1, 2).reshape([batch, seq_len, num_q_heads * head_dim]);
+        let attn_output =
+            attn_output
+                .swap_dims(1, 2)
+                .reshape([batch, seq_len, num_q_heads * head_dim]);
         (self.o_proj.forward(attn_output), new_cache)
     }
 }
@@ -320,9 +378,12 @@ pub fn repeat_kv<B: Backend>(x: Tensor<B, 4>, n_rep: usize) -> Tensor<B, 4> {
         return x;
     }
     let [batch, num_kv_heads, seq_len, head_dim] = x.dims();
-    x.unsqueeze_dim::<5>(2)
-        .repeat_dim(2, n_rep)
-        .reshape([batch, num_kv_heads * n_rep, seq_len, head_dim])
+    x.unsqueeze_dim::<5>(2).repeat_dim(2, n_rep).reshape([
+        batch,
+        num_kv_heads * n_rep,
+        seq_len,
+        head_dim,
+    ])
 }
 
 #[derive(Module, Debug)]
@@ -330,6 +391,28 @@ pub struct Qwen3MLP<B: Backend> {
     pub gate_proj: Linear<B>,
     pub up_proj: Linear<B>,
     pub down_proj: Linear<B>,
+}
+
+#[derive(Config, Debug)]
+pub struct Qwen3MLPConfig {
+    hidden_size: usize,
+    intermediate_size: usize,
+}
+
+impl Qwen3MLPConfig {
+    pub fn init<B: Backend>(&self, device: &B::Device) -> Qwen3MLP<B> {
+        Qwen3MLP {
+            gate_proj: LinearConfig::new(self.hidden_size, self.intermediate_size)
+                .with_bias(false)
+                .init(device),
+            up_proj: LinearConfig::new(self.hidden_size, self.intermediate_size)
+                .with_bias(false)
+                .init(device),
+            down_proj: LinearConfig::new(self.intermediate_size, self.hidden_size)
+                .with_bias(false)
+                .init(device),
+        }
+    }
 }
 
 impl<B: Backend> Qwen3MLP<B> {
@@ -349,6 +432,34 @@ pub struct Qwen3DecoderLayer<B: Backend> {
     pub mlp: Qwen3MLP<B>,
 }
 
+#[derive(Config, Debug)]
+pub struct Qwen3DecoderLayerConfig {
+    hidden_size: usize,
+    intermediate_size: usize,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    epsilon: f64,
+}
+
+impl Qwen3DecoderLayerConfig {
+    pub fn init<B: Backend>(&self, device: &B::Device) -> Qwen3DecoderLayer<B> {
+        Qwen3DecoderLayer {
+            input_layernorm: MyRmsNormConfig::new(self.hidden_size, self.epsilon).init(device),
+            self_attn: Qwen3AttentionConfig::new(
+                self.hidden_size,
+                self.num_q_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                self.epsilon,
+            )
+            .init(device),
+            post_attention_layernorm: MyRmsNormConfig::new(self.hidden_size, self.epsilon).init(device),
+            mlp: Qwen3MLPConfig::new(self.hidden_size, self.intermediate_size).init(device),
+        }
+    }
+}
+
 impl<B: Backend> Qwen3DecoderLayer<B> {
     pub fn forward(
         &self,
@@ -360,7 +471,8 @@ impl<B: Backend> Qwen3DecoderLayer<B> {
     ) -> (Tensor<B, 3>, KvCacheEntry<B>) {
         let residual = hidden_states.clone();
         let hidden_states = self.input_layernorm.forward(hidden_states);
-        let (hidden_states, new_cache) = self.self_attn.forward(hidden_states, cos, sin, causal_mask, kv_cache);
+        let (hidden_states, new_cache) =
+            self.self_attn.forward(hidden_states, cos, sin, causal_mask, kv_cache);
         let hidden_states = hidden_states.add(residual);
 
         let residual = hidden_states.clone();
@@ -371,13 +483,46 @@ impl<B: Backend> Qwen3DecoderLayer<B> {
 }
 
 #[derive(Module, Debug)]
-pub struct Qwen3Model<B: Backend> {
+pub struct Qwen3ASRThinkerTextModel<B: Backend> {
     pub embed_tokens: Embedding<B>,
     pub layers: Vec<Qwen3DecoderLayer<B>>,
     pub norm: MyRmsNorm<B>,
 }
 
-impl<B: Backend> Qwen3Model<B> {
+#[derive(Config, Debug)]
+pub struct Qwen3ASRThinkerTextModelConfig {
+    vocab_size: usize,
+    hidden_size: usize,
+    intermediate_size: usize,
+    num_hidden_layers: usize,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    epsilon: f64,
+}
+
+impl Qwen3ASRThinkerTextModelConfig {
+    pub fn init<B: Backend>(&self, device: &B::Device) -> Qwen3ASRThinkerTextModel<B> {
+        let layer_config = Qwen3DecoderLayerConfig::new(
+            self.hidden_size,
+            self.intermediate_size,
+            self.num_q_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            self.epsilon,
+        );
+        let layers = (0..self.num_hidden_layers)
+            .map(|_| layer_config.init(device))
+            .collect();
+        Qwen3ASRThinkerTextModel {
+            embed_tokens: EmbeddingConfig::new(self.vocab_size, self.hidden_size).init(device),
+            layers,
+            norm: MyRmsNormConfig::new(self.hidden_size, self.epsilon).init(device),
+        }
+    }
+}
+
+impl<B: Backend> Qwen3ASRThinkerTextModel<B> {
     pub fn forward_embeds(
         &self,
         hidden_states: Tensor<B, 3>,
@@ -391,14 +536,16 @@ impl<B: Backend> Qwen3Model<B> {
             Some(cache) => {
                 for (index, layer) in self.layers.iter().enumerate() {
                     let cached = cache.layer(index);
-                    let (next_hidden, new_cache) = layer.forward(hidden_states, cos, sin, causal_mask.clone(), cached);
+                    let (next_hidden, new_cache) =
+                        layer.forward(hidden_states, cos, sin, causal_mask.clone(), cached);
                     cache.set_layer(index, new_cache);
                     hidden_states = next_hidden;
                 }
             }
             None => {
                 for layer in &self.layers {
-                    let (next_hidden, _) = layer.forward(hidden_states, cos, sin, causal_mask.clone(), None);
+                    let (next_hidden, _) =
+                        layer.forward(hidden_states, cos, sin, causal_mask.clone(), None);
                     hidden_states = next_hidden;
                 }
             }
@@ -417,6 +564,24 @@ pub struct EncoderAttention<B: Backend> {
     num_heads: usize,
 }
 
+#[derive(Config, Debug)]
+pub struct EncoderAttentionConfig {
+    d_model: usize,
+    num_heads: usize,
+}
+
+impl EncoderAttentionConfig {
+    pub fn init<B: Backend>(&self, device: &B::Device) -> EncoderAttention<B> {
+        EncoderAttention {
+            q_proj: LinearConfig::new(self.d_model, self.d_model).init(device),
+            k_proj: LinearConfig::new(self.d_model, self.d_model).init(device),
+            v_proj: LinearConfig::new(self.d_model, self.d_model).init(device),
+            out_proj: LinearConfig::new(self.d_model, self.d_model).init(device),
+            num_heads: self.num_heads,
+        }
+    }
+}
+
 impl<B: Backend> EncoderAttention<B> {
     pub fn forward(&self, hidden_states: Tensor<B, 3>) -> Tensor<B, 3> {
         let [batch, seq_len, d_model] = hidden_states.dims();
@@ -427,16 +592,24 @@ impl<B: Backend> EncoderAttention<B> {
         let k = self.k_proj.forward(hidden_states.clone());
         let v = self.v_proj.forward(hidden_states);
 
-        let q = q.reshape([batch, seq_len, num_heads, head_dim]).swap_dims(1, 2);
-        let k = k.reshape([batch, seq_len, num_heads, head_dim]).swap_dims(1, 2);
-        let v = v.reshape([batch, seq_len, num_heads, head_dim]).swap_dims(1, 2);
+        let q = q
+            .reshape([batch, seq_len, num_heads, head_dim])
+            .swap_dims(1, 2);
+        let k = k
+            .reshape([batch, seq_len, num_heads, head_dim])
+            .swap_dims(1, 2);
+        let v = v
+            .reshape([batch, seq_len, num_heads, head_dim])
+            .swap_dims(1, 2);
 
         let scale = (head_dim as f64).sqrt();
         let attn_weights = q.matmul(k.swap_dims(2, 3)).div_scalar(scale);
         let attn_weights = burn::tensor::activation::softmax(attn_weights, 3);
         let attn_output = attn_weights.matmul(v);
 
-        let attn_output = attn_output.swap_dims(1, 2).reshape([batch, seq_len, d_model]);
+        let attn_output = attn_output
+            .swap_dims(1, 2)
+            .reshape([batch, seq_len, d_model]);
         self.out_proj.forward(attn_output)
     }
 }
@@ -448,6 +621,27 @@ pub struct AudioEncoderLayer<B: Backend> {
     pub fc1: Linear<B>,
     pub fc2: Linear<B>,
     pub final_layer_norm: MyLayerNorm<B>,
+}
+
+#[derive(Config, Debug)]
+pub struct AudioEncoderLayerModuleConfig {
+    d_model: usize,
+    encoder_ffn_dim: usize,
+    encoder_attention_heads: usize,
+    epsilon: f64,
+}
+
+impl AudioEncoderLayerModuleConfig {
+    pub fn init<B: Backend>(&self, device: &B::Device) -> AudioEncoderLayer<B> {
+        AudioEncoderLayer {
+            self_attn_layer_norm: MyLayerNormConfig::new(self.d_model, self.epsilon).init(device),
+            self_attn: EncoderAttentionConfig::new(self.d_model, self.encoder_attention_heads)
+                .init(device),
+            fc1: LinearConfig::new(self.d_model, self.encoder_ffn_dim).init(device),
+            fc2: LinearConfig::new(self.encoder_ffn_dim, self.d_model).init(device),
+            final_layer_norm: MyLayerNormConfig::new(self.d_model, self.epsilon).init(device),
+        }
+    }
 }
 
 impl<B: Backend> AudioEncoderLayer<B> {
@@ -467,7 +661,7 @@ impl<B: Backend> AudioEncoderLayer<B> {
 }
 
 #[derive(Module, Debug)]
-pub struct AudioTower<B: Backend> {
+pub struct Qwen3ASRAudioEncoder<B: Backend> {
     pub conv2d1: Conv2d<B>,
     pub conv2d2: Conv2d<B>,
     pub conv2d3: Conv2d<B>,
@@ -478,7 +672,62 @@ pub struct AudioTower<B: Backend> {
     pub proj2: Linear<B>,
 }
 
-impl<B: Backend> AudioTower<B> {
+#[derive(Config, Debug)]
+pub struct Qwen3ASRAudioEncoderModuleConfig {
+    d_model: usize,
+    encoder_ffn_dim: usize,
+    encoder_layers: usize,
+    encoder_attention_heads: usize,
+    downsample_hidden_size: usize,
+    num_mel_bins: usize,
+    output_dim: usize,
+    epsilon: f64,
+}
+
+impl Qwen3ASRAudioEncoderModuleConfig {
+    pub fn init<B: Backend>(&self, device: &B::Device) -> Qwen3ASRAudioEncoder<B> {
+        let conv_freq_bins = (((self.num_mel_bins + 1) / 2 + 1) / 2 + 1) / 2;
+        let conv_out_dim = self.downsample_hidden_size * conv_freq_bins;
+        let layer_config = AudioEncoderLayerModuleConfig::new(
+            self.d_model,
+            self.encoder_ffn_dim,
+            self.encoder_attention_heads,
+            self.epsilon,
+        );
+        let layers = (0..self.encoder_layers)
+            .map(|_| layer_config.init(device))
+            .collect();
+        Qwen3ASRAudioEncoder {
+            conv2d1: Conv2dConfig::new([1, self.downsample_hidden_size], [3, 3])
+                .with_stride([2, 2])
+                .with_padding(PaddingConfig2d::Explicit(1, 1, 1, 1))
+                .init(device),
+            conv2d2: Conv2dConfig::new(
+                [self.downsample_hidden_size, self.downsample_hidden_size],
+                [3, 3],
+            )
+            .with_stride([2, 2])
+            .with_padding(PaddingConfig2d::Explicit(1, 1, 1, 1))
+            .init(device),
+            conv2d3: Conv2dConfig::new(
+                [self.downsample_hidden_size, self.downsample_hidden_size],
+                [3, 3],
+            )
+            .with_stride([2, 2])
+            .with_padding(PaddingConfig2d::Explicit(1, 1, 1, 1))
+            .init(device),
+            conv_out: LinearConfig::new(conv_out_dim, self.d_model)
+                .with_bias(false)
+                .init(device),
+            layers,
+            ln_post: MyLayerNormConfig::new(self.d_model, self.epsilon).init(device),
+            proj1: LinearConfig::new(self.d_model, self.d_model).init(device),
+            proj2: LinearConfig::new(self.d_model, self.output_dim).init(device),
+        }
+    }
+}
+
+impl<B: Backend> Qwen3ASRAudioEncoder<B> {
     pub fn forward(&self, mel: Tensor<B, 3>) -> Tensor<B, 3> {
         let [_batch, _n_mels, mel_time] = mel.dims();
         let chunk_size: usize = 100;
@@ -526,12 +775,19 @@ impl<B: Backend> AudioTower<B> {
         let x = burn::tensor::activation::gelu(self.conv2d3.forward(x));
 
         let [batch, channels, freq_bins, time] = x.dims();
-        let x = x.swap_dims(1, 3).swap_dims(2, 3).reshape([batch, time, channels * freq_bins]);
+        let x = x
+            .swap_dims(1, 3)
+            .swap_dims(2, 3)
+            .reshape([batch, time, channels * freq_bins]);
         self.conv_out.forward(x)
     }
 }
 
-fn sinusoidal_position_embedding<B: Backend>(length: usize, channels: usize, device: &B::Device) -> Tensor<B, 3> {
+fn sinusoidal_position_embedding<B: Backend>(
+    length: usize,
+    channels: usize,
+    device: &B::Device,
+) -> Tensor<B, 3> {
     let log_timescale_increment = (10000.0f64).ln() / (channels as f64 / 2.0 - 1.0);
     let half_channels = channels / 2;
     let mut emb = Vec::with_capacity(length * channels);
@@ -553,110 +809,72 @@ fn sinusoidal_position_embedding<B: Backend>(length: usize, channels: usize, dev
 }
 
 #[derive(Module, Debug)]
-pub struct Thinker<B: Backend> {
-    pub audio_tower: AudioTower<B>,
-    pub model: Qwen3Model<B>,
+pub struct Qwen3ASRThinkerForConditionalGeneration<B: Backend> {
+    pub audio_tower: Qwen3ASRAudioEncoder<B>,
+    pub model: Qwen3ASRThinkerTextModel<B>,
     pub lm_head: Linear<B>,
+}
+
+#[derive(Config, Debug)]
+pub struct Qwen3ASRThinkerForConditionalGenerationConfig {
+    audio_tower: Qwen3ASRAudioEncoderModuleConfig,
+    model: Qwen3ASRThinkerTextModelConfig,
+}
+
+impl Qwen3ASRThinkerForConditionalGenerationConfig {
+    pub fn init<B: Backend>(&self, device: &B::Device) -> Qwen3ASRThinkerForConditionalGeneration<B> {
+        Qwen3ASRThinkerForConditionalGeneration {
+            audio_tower: self.audio_tower.init(device),
+            model: self.model.init(device),
+            lm_head: LinearConfig::new(self.model.hidden_size, self.model.vocab_size)
+                .with_bias(false)
+                .init(device),
+        }
+    }
 }
 
 #[derive(Module, Debug)]
 pub struct Qwen3ASR<B: Backend> {
-    pub thinker: Thinker<B>,
+    pub thinker: Qwen3ASRThinkerForConditionalGeneration<B>,
 }
 
+#[derive(Config, Debug)]
 pub struct Qwen3ASRConfig {
-    pub audio_config: AudioEncoderConfig,
-    pub text_config: TextConfig,
+    thinker: Qwen3ASRThinkerForConditionalGenerationConfig,
 }
 
 impl Qwen3ASRConfig {
-    pub fn new(audio_config: AudioEncoderConfig, text_config: TextConfig) -> Self {
-        Self { audio_config, text_config }
+    pub fn from_configs(audio_config: AudioEncoderConfig, text_config: TextConfig) -> Self {
+        let eps = text_config.rms_norm_eps;
+        Self {
+            thinker: Qwen3ASRThinkerForConditionalGenerationConfig::new(
+                Qwen3ASRAudioEncoderModuleConfig::new(
+                    audio_config.d_model,
+                    audio_config.encoder_ffn_dim,
+                    audio_config.encoder_layers,
+                    audio_config.encoder_attention_heads,
+                    audio_config.downsample_hidden_size,
+                    audio_config.num_mel_bins,
+                    audio_config.output_dim,
+                    eps,
+                ),
+                Qwen3ASRThinkerTextModelConfig::new(
+                    text_config.vocab_size,
+                    text_config.hidden_size,
+                    text_config.intermediate_size,
+                    text_config.num_hidden_layers,
+                    text_config.num_attention_heads,
+                    text_config.num_key_value_heads,
+                    text_config.head_dim,
+                    eps,
+                ),
+            ),
+        }
     }
 
     pub fn init<B: Backend>(&self, device: &B::Device) -> Qwen3ASR<B> {
-        let d = self.audio_config.d_model;
-        let ffn = self.audio_config.encoder_ffn_dim;
-        let ds = self.audio_config.downsample_hidden_size;
-        let num_mel_bins = self.audio_config.num_mel_bins;
-        let conv_freq_bins = (((num_mel_bins + 1) / 2 + 1) / 2 + 1) / 2;
-        let conv_out_dim = ds * conv_freq_bins;
-        let eps = self.text_config.rms_norm_eps;
-
-        let encoder_layers: Vec<AudioEncoderLayer<B>> = (0..self.audio_config.encoder_layers)
-            .map(|_| AudioEncoderLayer {
-                self_attn_layer_norm: MyLayerNorm::new(d, eps, device),
-                self_attn: EncoderAttention {
-                    q_proj: LinearConfig::new(d, d).init(device),
-                    k_proj: LinearConfig::new(d, d).init(device),
-                    v_proj: LinearConfig::new(d, d).init(device),
-                    out_proj: LinearConfig::new(d, d).init(device),
-                    num_heads: self.audio_config.encoder_attention_heads,
-                },
-                fc1: LinearConfig::new(d, ffn).init(device),
-                fc2: LinearConfig::new(ffn, d).init(device),
-                final_layer_norm: MyLayerNorm::new(d, eps, device),
-            })
-            .collect();
-
-        let hidden = self.text_config.hidden_size;
-        let intermediate = self.text_config.intermediate_size;
-        let n_q = self.text_config.num_attention_heads;
-        let n_kv = self.text_config.num_key_value_heads;
-        let hd = self.text_config.head_dim;
-
-        let decoder_layers: Vec<Qwen3DecoderLayer<B>> =
-            (0..self.text_config.num_hidden_layers)
-                .map(|_| Qwen3DecoderLayer {
-                    input_layernorm: MyRmsNorm::new(hidden, eps, device),
-                    self_attn: Qwen3Attention {
-                        q_proj: LinearConfig::new(hidden, n_q * hd).with_bias(false).init(device),
-                        k_proj: LinearConfig::new(hidden, n_kv * hd).with_bias(false).init(device),
-                        v_proj: LinearConfig::new(hidden, n_kv * hd).with_bias(false).init(device),
-                        o_proj: LinearConfig::new(n_q * hd, hidden).with_bias(false).init(device),
-                        q_norm: QKNorm { weight: Param::from_tensor(Tensor::ones([hd], device)), epsilon: eps },
-                        k_norm: QKNorm { weight: Param::from_tensor(Tensor::ones([hd], device)), epsilon: eps },
-                        num_q_heads: n_q,
-                        num_kv_heads: n_kv,
-                        head_dim: hd,
-                    },
-                    post_attention_layernorm: MyRmsNorm::new(hidden, eps, device),
-                    mlp: Qwen3MLP {
-                        gate_proj: LinearConfig::new(hidden, intermediate).with_bias(false).init(device),
-                        up_proj: LinearConfig::new(hidden, intermediate).with_bias(false).init(device),
-                        down_proj: LinearConfig::new(intermediate, hidden).with_bias(false).init(device),
-                    },
-                })
-                .collect();
-
         Qwen3ASR {
-            thinker: Thinker {
-                audio_tower: AudioTower {
-                    conv2d1: Conv2dConfig::new([1, ds], [3, 3])
-                        .with_stride([2, 2])
-                        .with_padding(PaddingConfig2d::Explicit(1, 1, 1, 1))
-                        .init(device),
-                    conv2d2: Conv2dConfig::new([ds, ds], [3, 3])
-                        .with_stride([2, 2])
-                        .with_padding(PaddingConfig2d::Explicit(1, 1, 1, 1))
-                        .init(device),
-                    conv2d3: Conv2dConfig::new([ds, ds], [3, 3])
-                        .with_stride([2, 2])
-                        .with_padding(PaddingConfig2d::Explicit(1, 1, 1, 1))
-                        .init(device),
-                    conv_out: LinearConfig::new(conv_out_dim, d).with_bias(false).init(device),
-                    layers: encoder_layers,
-                    ln_post: MyLayerNorm::new(d, eps, device),
-                    proj1: LinearConfig::new(d, d).init(device),
-                    proj2: LinearConfig::new(d, self.audio_config.output_dim).init(device),
-                },
-                model: Qwen3Model {
-                    embed_tokens: EmbeddingConfig::new(self.text_config.vocab_size, hidden).init(device),
-                    layers: decoder_layers,
-                    norm: MyRmsNorm::new(hidden, eps, device),
-                },
-                lm_head: LinearConfig::new(hidden, self.text_config.vocab_size).with_bias(false).init(device),
-            },
+            thinker: self.thinker.init(device),
         }
     }
 }
@@ -670,7 +888,11 @@ pub fn create_mrope(text_config: &TextConfig) -> MRoPE {
     )
 }
 
-pub fn create_causal_mask<B: Backend>(seq_len: usize, past_len: usize, device: &B::Device) -> Tensor<B, 4, Bool> {
+pub fn create_causal_mask<B: Backend>(
+    seq_len: usize,
+    past_len: usize,
+    device: &B::Device,
+) -> Tensor<B, 4, Bool> {
     let total_len = past_len + seq_len;
     let mut values = Vec::with_capacity(seq_len * total_len);
     for row in 0..seq_len {
@@ -679,6 +901,7 @@ pub fn create_causal_mask<B: Backend>(seq_len: usize, past_len: usize, device: &
             values.push(col > current_pos);
         }
     }
-    let mask = Tensor::<B, 1, Bool>::from_bool(values.as_slice().into(), device).reshape([seq_len, total_len]);
+    let mask = Tensor::<B, 1, Bool>::from_bool(values.as_slice().into(), device)
+        .reshape([seq_len, total_len]);
     mask.unsqueeze_dim::<3>(0).unsqueeze_dim::<4>(0)
 }

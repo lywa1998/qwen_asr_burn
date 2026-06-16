@@ -27,7 +27,7 @@ impl<B: Backend> AsrPipeline<B> {
         let audio_config = model_config.thinker_config.audio_config.clone();
         let text_config = model_config.thinker_config.text_config.clone();
 
-        let burn_config = Qwen3ASRConfig::new(audio_config, text_config.clone());
+        let burn_config = Qwen3ASRConfig::from_configs(audio_config, text_config.clone());
         let mut model = burn_config.init(&device);
 
         let weights_path = format!("{}/model.safetensors", model_dir);
