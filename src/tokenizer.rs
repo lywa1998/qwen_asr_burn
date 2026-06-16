@@ -9,6 +9,7 @@ pub struct Qwen2Tokenizer {
     pub im_start: u32,
     pub im_end: u32,
     pub eos_token_id: u32,
+    pub timestamp_id: u32,
 }
 
 impl Qwen2Tokenizer {
@@ -23,6 +24,7 @@ impl Qwen2Tokenizer {
         let im_start_id = required_token_id(&tokenizer, "<|im_start|>")?;
         let im_end_id = required_token_id(&tokenizer, "<|im_end|>")?;
         let eos_id = required_token_id(&tokenizer, "<|endoftext|>")?;
+        let timestamp_id = required_token_id(&tokenizer, "<timestamp>")?;
 
         log::info!("Audio tokens: start={audio_start_id}, end={audio_end_id}, pad={audio_pad_id}");
         log::info!("Chat tokens: im_start={im_start_id}, im_end={im_end_id}, eos={eos_id}");
@@ -35,6 +37,7 @@ impl Qwen2Tokenizer {
             im_start: im_start_id,
             im_end: im_end_id,
             eos_token_id: eos_id,
+            timestamp_id,
         })
     }
 

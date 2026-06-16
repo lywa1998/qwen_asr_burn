@@ -193,7 +193,7 @@ impl MelSpectrogram {
                 let max_val = 2.0_f32.powi(spec.bits_per_sample as i32 - 1);
                 reader
                     .samples::<i32>()
-                    .try_collect::<Vec<_>>()
+                    .collect::<Result<Vec<_>, _>>()
                     .map_err(|e| anyhow!("WAV read error: {e}"))?
                     .into_iter()
                     .map(|s| s as f32 / max_val)
@@ -201,7 +201,7 @@ impl MelSpectrogram {
             }
             hound::SampleFormat::Float => reader
                 .samples::<f32>()
-                .try_collect::<Vec<_>>()
+                .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| anyhow!("WAV read error: {e}"))?,
         };
 

@@ -99,6 +99,37 @@ impl ModelConfig {
     }
 }
 
+// --- ForcedAligner config types ---
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ForcedAlignerConfig {
+    pub thinker_config: ForcedAlignerThinkerConfig,
+    #[serde(default)]
+    pub timestamp_segment_time: u32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ForcedAlignerThinkerConfig {
+    pub audio_config: AudioEncoderConfig,
+    pub text_config: TextConfig,
+    #[serde(default)]
+    pub classify_num: usize,
+    #[serde(default)]
+    pub audio_start_token_id: u32,
+    #[serde(default)]
+    pub audio_end_token_id: u32,
+    #[serde(default)]
+    pub audio_token_id: u32,
+}
+
+impl ForcedAlignerConfig {
+    pub fn from_dir(model_dir: &str) -> anyhow::Result<Self> {
+        let path = format!("{}/config.json", model_dir);
+        let content = std::fs::read_to_string(&path)?;
+        Ok(serde_json::from_str(&content)?)
+    }
+}
+
 impl PreprocessorConfig {
     pub fn from_dir(model_dir: &str) -> anyhow::Result<Self> {
         let path = format!("{}/preprocessor_config.json", model_dir);
