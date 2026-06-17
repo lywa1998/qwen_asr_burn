@@ -177,7 +177,11 @@ impl<B: Backend> AlignPipeline<B> {
         let logit_seq_len = logits.dims()[1];
 
         // 9. Extract logits at timestamp positions
-        let timestamp_id = self.tokenizer.timestamp_id;
+        let timestamp_id = *self
+            .tokenizer
+            .timestamp_id
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("tokenizer is missing <timestamp> (required for alignment)"))?;
         let timestamp_positions: Vec<usize> = input_ids
             .iter()
             .enumerate()

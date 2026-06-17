@@ -1,195 +1,244 @@
 use anyhow::anyhow;
-use rustfft::{num_complex::Complex32, FftPlanner};
+use rustfft::{num_complex::Complex, FftPlanner};
 
 pub struct MelSpectrogram {
     n_fft: usize,
     hop_length: usize,
-    n_mels: usize,
-    sample_rate: u32,
+    num_mel_bins: usize,
+    n_freqs: usize,
     hann_window: Vec<f32>,
-    mel_filters: Vec<Vec<f32>>,
-    center: bool,
+    mel_filters: Vec<f32>, // flat: [num_mel_bins × n_freqs]
 }
 
 impl MelSpectrogram {
     pub fn new(n_fft: usize, hop_length: usize, n_mels: usize, sample_rate: u32) -> Self {
-        let hann_window = (0..n_fft)
-            .map(|i| {
-                let two_pi_n = 2.0 * std::f32::consts::PI * i as f32 / (n_fft as f32);
-                0.5 - 0.5 * two_pi_n.cos()
-            })
-            .collect();
-
-        let mel_filters = Self::create_mel_filterbank(n_mels, n_fft / 2 + 1, sample_rate, n_fft);
-
-        Self {
-            n_fft,
-            hop_length,
-            n_mels,
-            sample_rate,
-            hann_window,
-            mel_filters,
-            center: true,
-        }
+        let n_freqs = n_fft / 2 + 1;
+        let hann_window = hann_window(n_fft);
+        let mel_filters =
+            create_mel_filterbank(n_mels, n_fft, sample_rate, 0.0, sample_rate as f64 / 2.0);
+        Self { n_fft, hop_length, num_mel_bins: n_mels, n_freqs, hann_window, mel_filters }
     }
 
-    fn create_mel_filterbank(
-        n_mels: usize,
-        n_freq_bins: usize,
-        sample_rate: u32,
-        _n_fft: usize,
-    ) -> Vec<Vec<f32>> {
-        let f_min = 0.0;
-        let f_max = sample_rate as f32 / 2.0;
-
-        let mel_min = Self::hz_to_mel_slaney(f_min);
-        let mel_max = Self::hz_to_mel_slaney(f_max);
-
-        let mel_freqs: Vec<f32> = (0..(n_mels + 2))
-            .map(|i| mel_min + (mel_max - mel_min) * i as f32 / (n_mels + 1) as f32)
-            .collect();
-
-        let filter_freqs: Vec<f32> = mel_freqs
-            .iter()
-            .map(|&m| Self::mel_to_hz_slaney(m))
-            .collect();
-
-        let fft_freqs: Vec<f32> = (0..n_freq_bins)
-            .map(|i| (sample_rate as f32 / 2.0) * i as f32 / (n_freq_bins - 1) as f32)
-            .collect();
-
-        let mut mel_filters = vec![vec![0.0f32; n_mels]; n_freq_bins];
-
-        for i in 0..n_mels {
-            let left = filter_freqs[i];
-            let center = filter_freqs[i + 1];
-            let right = filter_freqs[i + 2];
-
-            for (j, &freq) in fft_freqs.iter().enumerate() {
-                if freq >= left && freq <= center {
-                    mel_filters[j][i] = (freq - left) / (center - left);
-                } else if freq >= center && freq <= right {
-                    mel_filters[j][i] = (right - freq) / (right - center);
-                }
-            }
-        }
-
-        for i in 0..n_mels {
-            let enorm = 2.0 / (filter_freqs[i + 2] - filter_freqs[i]);
-            for j in 0..n_freq_bins {
-                mel_filters[j][i] *= enorm;
-            }
-        }
-
-        let mut filters = vec![vec![0.0f32; n_freq_bins]; n_mels];
-        for i in 0..n_mels {
-            for j in 0..n_freq_bins {
-                filters[i][j] = mel_filters[j][i];
-            }
-        }
-
-        filters
-    }
-
-    fn hz_to_mel_slaney(hz: f32) -> f32 {
-        2595.0 * (1.0 + hz / 700.0).log10()
-    }
-
-    fn mel_to_hz_slaney(mel: f32) -> f32 {
-        700.0 * (10.0f32.powf(mel / 2595.0) - 1.0)
-    }
-
-    fn hz_to_mel(hz: f32) -> f32 {
-        2595.0 * (1.0 + hz / 700.0).log10()
-    }
-
-    fn mel_to_hz(mel: f32) -> f32 {
-        700.0 * (10.0f32.powf(mel / 2595.0) - 1.0)
-    }
-
+    /// Extract log-mel spectrogram.
+    /// Returns Vec<Vec<f32>> where the outer vec has length `num_mel_bins` and each
+    /// inner vec has length `n_frames`.
     pub fn compute(&self, samples: &[f32]) -> Vec<Vec<f32>> {
-        let samples = self.resample_if_needed(samples);
+        // Pad to next multiple of hop_length for consistent frame count
+        let padded_len = samples.len().div_ceil(self.hop_length) * self.hop_length;
+        let mut padded_samples = samples.to_vec();
+        padded_samples.resize(padded_len, 0.0);
 
-        let n_frames = if self.center {
-            1 + samples.len() / self.hop_length
-        } else {
-            (samples.len() - self.n_fft) / self.hop_length + 1
-        };
-        let n_frames = n_frames.max(1);
+        // Reflection-pad for center padding (n_fft/2 on each side)
+        // This matches torch.stft's default pad_mode='reflect' with center=True.
+        let pad = self.n_fft / 2;
+        let padded_signal = reflection_pad(&padded_samples, pad);
 
-        let pad_len = if self.center { self.n_fft / 2 } else { 0 };
+        // STFT power spectrum: [n_freqs × n_frames_with_last], column-major
+        let (power, n_frames_with_last) =
+            compute_power_stft(&padded_signal, self.n_fft, self.hop_length, &self.hann_window);
 
-        let mut planner = FftPlanner::new();
-        let fft = planner.plan_fft_forward(self.n_fft);
+        // Remove last frame (matches torch.stft[..., :-1] in WhisperFeatureExtractor)
+        let n_frames = if n_frames_with_last > 0 { n_frames_with_last - 1 } else { 0 };
 
-        let n_freq_bins = self.n_fft / 2 + 1;
-        let mut spectrogram = vec![vec![0.0f32; n_freq_bins]; n_frames];
-
-        for frame_idx in 0..n_frames {
-            let start = frame_idx as isize * self.hop_length as isize - pad_len as isize;
-            let mut frame = vec![Complex32::new(0.0, 0.0); self.n_fft];
-
-            for i in 0..self.n_fft {
-                let sample_idx = start + i as isize;
-                let val = if sample_idx >= 0 && (sample_idx as usize) < samples.len() {
-                    samples[sample_idx as usize]
-                } else {
-                    0.0
-                };
-                frame[i] = Complex32::new(val * self.hann_window[i], 0.0);
-            }
-
-            fft.process(&mut frame);
-
-            for j in 0..n_freq_bins {
-                let re = frame[j].re;
-                let im = frame[j].im;
-                spectrogram[frame_idx][j] = re * re + im * im;
-            }
-        }
-
-        let mut mel_spec = vec![vec![0.0f32; n_frames]; self.n_mels];
-        for i in 0..self.n_mels {
-            for j in 0..n_frames {
-                let mut sum = 0.0;
-                for k in 0..n_freq_bins {
-                    sum += spectrogram[j][k] * self.mel_filters[i][k];
+        // Apply mel filterbank: [num_mel_bins × n_freqs] · [n_freqs × n_frames]
+        // → [num_mel_bins × n_frames]
+        let mut mel_spec = vec![0.0f32; self.num_mel_bins * n_frames];
+        for m in 0..self.num_mel_bins {
+            let filter_row = &self.mel_filters[m * self.n_freqs..(m + 1) * self.n_freqs];
+            let out_row = &mut mel_spec[m * n_frames..(m + 1) * n_frames];
+            for f in 0..self.n_freqs {
+                let w = filter_row[f];
+                if w == 0.0 {
+                    continue;
                 }
-                mel_spec[i][j] = sum.max(1e-10).log10();
+                let power_row = &power[f * n_frames_with_last..f * n_frames_with_last + n_frames];
+                for (t, &p) in power_row.iter().enumerate() {
+                    out_row[t] += w * p;
+                }
             }
         }
 
-        let n_frames = if n_frames > 1 { n_frames - 1 } else { n_frames };
-        for row in mel_spec.iter_mut().take(self.n_mels) {
-            row.truncate(n_frames);
-        }
-
-        let mut global_max = f32::NEG_INFINITY;
-        for row in mel_spec.iter().take(self.n_mels) {
-            for &value in row.iter().take(n_frames) {
-                global_max = global_max.max(value);
-            }
-        }
-        let clamp_min = global_max - 8.0;
-        for row in mel_spec.iter_mut().take(self.n_mels) {
-            for value in row.iter_mut().take(n_frames) {
-                *value = (*value).max(clamp_min);
-                *value = (*value + 4.0) / 4.0;
+        // Log normalization: log10 via ln/ln(10)
+        let log10_factor = 1.0 / 10.0f32.ln();
+        let mut max_val = f32::NEG_INFINITY;
+        for v in mel_spec.iter_mut() {
+            *v = v.max(1e-10f32).ln() * log10_factor;
+            if *v > max_val {
+                max_val = *v;
             }
         }
 
-        mel_spec
+        // Clamp and normalize: max(log_mel, max_val - 8.0) then (x + 4) / 4
+        let min_val = max_val - 8.0;
+        for v in mel_spec.iter_mut() {
+            *v = (v.max(min_val) + 4.0) / 4.0;
+        }
+
+        // Convert flat to Vec<Vec<f32>> format expected by callers
+        let mut result = vec![vec![0.0f32; n_frames]; self.num_mel_bins];
+        for m in 0..self.num_mel_bins {
+            let start = m * n_frames;
+            result[m].copy_from_slice(&mel_spec[start..start + n_frames]);
+        }
+        result
     }
 
-    fn resample_if_needed(&self, samples: &[f32]) -> Vec<f32> {
-        samples.to_vec()
-    }
-
+    /// Compute mel spectrogram from a WAV file path (loads & resamples internally).
     pub fn compute_from_wav(&self, wav_path: &str) -> anyhow::Result<Vec<Vec<f32>>> {
         let resampled = load_wav_samples(wav_path)?;
         Ok(self.compute(&resampled))
     }
 }
+
+// ─── Hann window ────────────────────────────────────────────────────────────
+
+/// Standard Hann window: `0.5 * (1 - cos(2πi / (N-1)))`.
+/// Matches `torch.hann_window(N)`.
+fn hann_window(n: usize) -> Vec<f32> {
+    let denom = (n - 1) as f32;
+    (0..n)
+        .map(|i| {
+            let x = 2.0 * std::f32::consts::PI * i as f32 / denom;
+            0.5 * (1.0 - x.cos())
+        })
+        .collect()
+}
+
+// ─── Reflection padding ─────────────────────────────────────────────────────
+
+/// Mirror the signal at both ends by `pad` samples.
+/// Matches `torch.stft` default `pad_mode='reflect'`.
+fn reflection_pad(signal: &[f32], pad: usize) -> Vec<f32> {
+    let n = signal.len();
+    let mut padded = Vec::with_capacity(n + 2 * pad);
+    for i in (1..=pad.min(n - 1)).rev() {
+        padded.push(signal[i]);
+    }
+    padded.extend_from_slice(signal);
+    let right_start = if n > pad { n - pad - 1 } else { 0 };
+    for i in (right_start..n - 1).rev() {
+        padded.push(signal[i]);
+    }
+    padded
+}
+
+// ─── STFT ───────────────────────────────────────────────────────────────────
+
+/// Compute power spectrogram (magnitude squared) from a pre-padded signal.
+/// Returns flat column-major array `[n_freqs × n_frames]` and the frame count.
+fn compute_power_stft(
+    signal: &[f32],
+    n_fft: usize,
+    hop_length: usize,
+    window: &[f32],
+) -> (Vec<f32>, usize) {
+    let n_freqs = n_fft / 2 + 1;
+    let n_frames = if signal.len() >= n_fft {
+        (signal.len() - n_fft) / hop_length + 1
+    } else {
+        0
+    };
+
+    let mut planner = FftPlanner::<f32>::new();
+    let fft = planner.plan_fft_forward(n_fft);
+
+    // Column-major: power[f * n_frames + t] for frequency f, frame t
+    let mut power = vec![0.0f32; n_freqs * n_frames];
+    let mut frame_buf = vec![Complex::new(0.0f32, 0.0f32); n_fft];
+
+    for t in 0..n_frames {
+        let start = t * hop_length;
+        for j in 0..n_fft {
+            frame_buf[j] = Complex::new(signal[start + j] * window[j], 0.0);
+        }
+        fft.process(&mut frame_buf);
+        for f in 0..n_freqs {
+            let re = frame_buf[f].re;
+            let im = frame_buf[f].im;
+            power[f * n_frames + t] = re * re + im * im;
+        }
+    }
+
+    (power, n_frames)
+}
+
+// ─── Mel filterbank ─────────────────────────────────────────────────────────
+
+/// Create mel filterbank matrix, flat `[num_mels × n_freqs]`.
+/// Uses the Slaney mel scale with a linear region below 1000 Hz.
+/// Matches `librosa.filters.mel(sr, n_fft, n_mels, htk=True, norm="slaney")`
+/// and the candle reference implementation.
+fn create_mel_filterbank(
+    num_mels: usize,
+    n_fft: usize,
+    sample_rate: u32,
+    fmin: f64,
+    fmax: f64,
+) -> Vec<f32> {
+    let n_freqs = n_fft / 2 + 1;
+    let sr = sample_rate as f64;
+
+    // Slaney mel scale (linear < 1000 Hz, logarithmic above)
+    let f_sp = 200.0 / 3.0; // ~66.67 Hz/mel in the linear region
+    let min_log_hz = 1000.0;
+    let min_log_mel = min_log_hz / f_sp;
+    let logstep = (6.4f64).ln() / 27.0;
+
+    let hz_to_mel = |f: f64| -> f64 {
+        if f < min_log_hz {
+            f / f_sp
+        } else {
+            min_log_mel + (f / min_log_hz).ln() / logstep
+        }
+    };
+
+    let mel_to_hz = |m: f64| -> f64 {
+        if m < min_log_mel {
+            f_sp * m
+        } else {
+            min_log_hz * (logstep * (m - min_log_mel)).exp()
+        }
+    };
+
+    let mel_min = hz_to_mel(fmin);
+    let mel_max = hz_to_mel(fmax);
+
+    let filter_freqs: Vec<f64> = (0..num_mels + 2)
+        .map(|i| {
+            let mel = mel_min + (mel_max - mel_min) * i as f64 / (num_mels + 1) as f64;
+            mel_to_hz(mel)
+        })
+        .collect();
+
+    let all_freqs: Vec<f64> = (0..n_freqs)
+        .map(|j| j as f64 * sr / n_fft as f64)
+        .collect();
+
+    let f_diff: Vec<f64> = filter_freqs.windows(2).map(|w| w[1] - w[0]).collect();
+
+    let mut filters = vec![0.0f32; num_mels * n_freqs];
+
+    for j in 0..n_freqs {
+        for i in 0..num_mels {
+            let down = (all_freqs[j] - filter_freqs[i]) / f_diff[i];
+            let up = (filter_freqs[i + 2] - all_freqs[j]) / f_diff[i + 1];
+            let val = down.min(up).max(0.0);
+            filters[i * n_freqs + j] = val as f32;
+        }
+    }
+
+    // Slaney normalization: area of each triangular filter = 1.0
+    for i in 0..num_mels {
+        let enorm = 2.0 / (filter_freqs[i + 2] - filter_freqs[i]);
+        for j in 0..n_freqs {
+            filters[i * n_freqs + j] *= enorm as f32;
+        }
+    }
+
+    filters
+}
+
+// ─── WAV loading ────────────────────────────────────────────────────────────
 
 /// Load a WAV file and resample to 16kHz mono f32.
 pub fn load_wav_samples(wav_path: &str) -> anyhow::Result<Vec<f32>> {
@@ -257,6 +306,28 @@ fn resample_with_rubato(samples: &[f32], src_rate: u32, dst_rate: u32) -> anyhow
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_hann_window_edges() {
+        let w = hann_window(400);
+        assert_eq!(w.len(), 400);
+        assert!(w[0].abs() < 1e-6);
+        assert!(w[399].abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_reflection_pad_basic() {
+        let signal = vec![1.0f32, 2.0, 3.0];
+        let padded = reflection_pad(&signal, 1);
+        assert_eq!(padded, vec![2.0f32, 1.0, 2.0, 3.0, 2.0]);
+    }
+
+    #[test]
+    fn test_mel_filterbank_shape() {
+        let filters = create_mel_filterbank(128, 400, 16000, 0.0, 8000.0);
+        assert_eq!(filters.len(), 128 * 201);
+        assert!(filters.iter().all(|&v| v >= 0.0));
+    }
 
     #[test]
     fn test_mel_spectrogram_shape() {
