@@ -186,68 +186,72 @@ impl MelSpectrogram {
     }
 
     pub fn compute_from_wav(&self, wav_path: &str) -> anyhow::Result<Vec<Vec<f32>>> {
-        let mut reader = hound::WavReader::open(wav_path)?;
-        let spec = reader.spec();
-        let samples: Vec<f32> = match spec.sample_format {
-            hound::SampleFormat::Int => {
-                let max_val = 2.0_f32.powi(spec.bits_per_sample as i32 - 1);
-                reader
-                    .samples::<i32>()
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|e| anyhow!("WAV read error: {e}"))?
-                    .into_iter()
-                    .map(|s| s as f32 / max_val)
-                    .collect()
-            }
-            hound::SampleFormat::Float => reader
-                .samples::<f32>()
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| anyhow!("WAV read error: {e}"))?,
-        };
-
-        let mono_samples: Vec<f32> = if spec.channels == 2 {
-            samples
-                .chunks(2)
-                .map(|chunk| (chunk[0] + chunk[1]) / 2.0)
-                .collect()
-        } else {
-            samples
-        };
-
-        let resampled = Self::resample_with_rubato(&mono_samples, spec.sample_rate, self.sample_rate)?;
-
+        let resampled = load_wav_samples(wav_path)?;
         Ok(self.compute(&resampled))
     }
+}
 
-    fn resample_with_rubato(samples: &[f32], src_rate: u32, dst_rate: u32) -> anyhow::Result<Vec<f32>> {
-        if src_rate == dst_rate {
-            return Ok(samples.to_vec());
+/// Load a WAV file and resample to 16kHz mono f32.
+pub fn load_wav_samples(wav_path: &str) -> anyhow::Result<Vec<f32>> {
+    let mut reader = hound::WavReader::open(wav_path)?;
+    let spec = reader.spec();
+    let samples: Vec<f32> = match spec.sample_format {
+        hound::SampleFormat::Int => {
+            let max_val = 2.0_f32.powi(spec.bits_per_sample as i32 - 1);
+            reader
+                .samples::<i32>()
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| anyhow!("WAV read error: {e}"))?
+                .into_iter()
+                .map(|s| s as f32 / max_val)
+                .collect()
         }
+        hound::SampleFormat::Float => reader
+            .samples::<f32>()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| anyhow!("WAV read error: {e}"))?,
+    };
 
-        use rubato::{
-            Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType,
-            WindowFunction,
-        };
+    let mono_samples: Vec<f32> = if spec.channels == 2 {
+        samples
+            .chunks(2)
+            .map(|chunk| (chunk[0] + chunk[1]) / 2.0)
+            .collect()
+    } else {
+        samples
+    };
 
-        let params = SincInterpolationParameters {
-            sinc_len: 256,
-            f_cutoff: 0.95,
-            interpolation: SincInterpolationType::Linear,
-            oversampling_factor: 256,
-            window: WindowFunction::BlackmanHarris2,
-        };
+    resample_with_rubato(&mono_samples, spec.sample_rate, 16_000)
+}
 
-        let mut resampler = SincFixedIn::<f32>::new(
-            dst_rate as f64 / src_rate as f64,
-            2.0,
-            params,
-            samples.len(),
-            1,
-        )?;
-
-        let output = resampler.process(&[samples.to_vec()], None)?;
-        Ok(output.into_iter().next().unwrap_or_default())
+fn resample_with_rubato(samples: &[f32], src_rate: u32, dst_rate: u32) -> anyhow::Result<Vec<f32>> {
+    if src_rate == dst_rate {
+        return Ok(samples.to_vec());
     }
+
+    use rubato::{
+        Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType,
+        WindowFunction,
+    };
+
+    let params = SincInterpolationParameters {
+        sinc_len: 256,
+        f_cutoff: 0.95,
+        interpolation: SincInterpolationType::Linear,
+        oversampling_factor: 256,
+        window: WindowFunction::BlackmanHarris2,
+    };
+
+    let mut resampler = SincFixedIn::<f32>::new(
+        dst_rate as f64 / src_rate as f64,
+        2.0,
+        params,
+        samples.len(),
+        1,
+    )?;
+
+    let output = resampler.process(&[samples.to_vec()], None)?;
+    Ok(output.into_iter().next().unwrap_or_default())
 }
 
 #[cfg(test)]

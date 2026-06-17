@@ -5,7 +5,7 @@ edition = "2021"
 default-run = "qwen-asr-burn"
 
 [dependencies]
-burn = { version = "0.21", features = ["cuda", "fusion", "std"], default-features = false }
+burn = { version = "0.21", features = ["fusion", "std"], default-features = false }
 burn-store = "0.21"
 clap = { version = "4", features = ["derive"] }
 tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
@@ -17,3 +17,11 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 log = "0.4"
 env_logger = "0.11"
+avio = "0.15"
+eax = "0.5"
+earshot = "1.1"
+
+[features]
+default = ["metal"]
+cuda = ["burn/cuda"]
+metal = ["burn/wgpu"]

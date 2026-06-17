@@ -4,6 +4,8 @@ use burn::tensor::{Int, Tensor};
 use crate::audio::MelSpectrogram;
 use crate::config::{ForcedAlignerConfig, PreprocessorConfig};
 use crate::model::{self, create_mrope, Qwen3ASR, Qwen3ASRConfig};
+#[cfg(feature = "metal")]
+use crate::pipeline::Bf16ToF32Adapter;
 use crate::text_processor::{self, TimestampItem};
 use crate::tokenizer::Qwen2Tokenizer;
 
@@ -31,9 +33,13 @@ impl<B: Backend> AlignPipeline<B> {
 
         let weights_path = format!("{}/model.safetensors", model_dir);
         {
-            use burn_store::{ModuleSnapshot, PyTorchToBurnAdapter, SafetensorsStore};
+            use burn_store::{ChainAdapter, ModuleSnapshot, PyTorchToBurnAdapter, SafetensorsStore};
+            #[cfg(feature = "metal")]
+            let adapter = ChainAdapter::new(PyTorchToBurnAdapter, Bf16ToF32Adapter);
+            #[cfg(not(feature = "metal"))]
+            let adapter = PyTorchToBurnAdapter;
             let mut store = SafetensorsStore::from_file(&weights_path)
-                .with_from_adapter(PyTorchToBurnAdapter)
+                .with_from_adapter(adapter)
                 .allow_partial(true);
             let result = model.load_from(&mut store)?;
             log::info!(

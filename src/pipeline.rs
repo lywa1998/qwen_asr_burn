@@ -1,10 +1,49 @@
 use burn::tensor::backend::Backend;
 use burn::tensor::{Int, Tensor};
 
-use crate::audio::MelSpectrogram;
+#[cfg(feature = "metal")]
+use std::rc::Rc;
+#[cfg(feature = "metal")]
+use burn::tensor::DType;
+#[cfg(feature = "metal")]
+use burn_store::{ModuleAdapter, TensorSnapshot};
+
+use crate::audio::{self, MelSpectrogram};
 use crate::config::{GenerationConfig, ModelConfig, PreprocessorConfig};
 use crate::model::{self, create_mrope, KvCache, Qwen3ASR, Qwen3ASRConfig};
 use crate::tokenizer::Qwen2Tokenizer;
+use crate::vad;
+
+/// Converts BF16 weights to F32 during loading (for backends that don't support BF16).
+#[cfg(feature = "metal")]
+#[derive(Clone)]
+pub(crate) struct Bf16ToF32Adapter;
+
+#[cfg(feature = "metal")]
+impl ModuleAdapter for Bf16ToF32Adapter {
+    fn adapt(&self, snapshot: &TensorSnapshot) -> TensorSnapshot {
+        if snapshot.dtype != DType::BF16 {
+            return snapshot.clone();
+        }
+        let original = snapshot.clone_data_fn();
+        let cast = Rc::new(move || {
+            let data = original()?;
+            Ok(data.convert_dtype(DType::F32))
+        });
+        TensorSnapshot::from_closure(
+            cast,
+            DType::F32,
+            snapshot.shape.clone(),
+            snapshot.path_stack.clone().unwrap_or_default(),
+            snapshot.container_stack.clone().unwrap_or_default(),
+            snapshot.tensor_id.unwrap_or_default(),
+        )
+    }
+
+    fn clone_box(&self) -> Box<dyn ModuleAdapter> {
+        Box::new(self.clone())
+    }
+}
 
 pub struct AsrPipeline<B: Backend> {
     model: Qwen3ASR<B>,
@@ -32,9 +71,13 @@ impl<B: Backend> AsrPipeline<B> {
 
         let weights_path = format!("{}/model.safetensors", model_dir);
         {
-            use burn_store::{ModuleSnapshot, PyTorchToBurnAdapter, SafetensorsStore};
-            let mut store =
-                SafetensorsStore::from_file(&weights_path).with_from_adapter(PyTorchToBurnAdapter);
+            use burn_store::{ChainAdapter, ModuleSnapshot, PyTorchToBurnAdapter, SafetensorsStore};
+            #[cfg(feature = "metal")]
+            let adapter = ChainAdapter::new(PyTorchToBurnAdapter, Bf16ToF32Adapter);
+            #[cfg(not(feature = "metal"))]
+            let adapter = PyTorchToBurnAdapter;
+            let mut store = SafetensorsStore::from_file(&weights_path)
+                .with_from_adapter(adapter);
             let result = model.load_from(&mut store)?;
             log::info!(
                 "Weight loading: {} applied, {} errors",
@@ -65,62 +108,55 @@ impl<B: Backend> AsrPipeline<B> {
         })
     }
 
-    pub fn transcribe(&self, wav_path: &str) -> anyhow::Result<String> {
+    pub fn transcribe(&self, wav_path: &str) -> anyhow::Result<(String, Vec<vad::VoiceSegment>)> {
         log::info!("Loading audio: {}", wav_path);
 
-        let mel_spec = self.mel_extractor.compute_from_wav(wav_path)?;
+        let samples = audio::load_wav_samples(wav_path)?;
+        let segments = vad::detect_segments(&samples);
+
+        if segments.is_empty() {
+            return Ok((String::new(), vec![]));
+        }
+
+        log::info!("Transcribing {} voice segments", segments.len());
+        let mut texts: Vec<String> = Vec::new();
+
+        for (i, seg) in segments.iter().enumerate() {
+            let start_sample = (seg.start_secs * 16_000.0) as usize;
+            let end_sample = (seg.end_secs * 16_000.0) as usize;
+            let seg_samples = &samples[start_sample.min(samples.len())..end_sample.min(samples.len())];
+
+            log::info!(
+                "Segment {}/{}: {:.2}s-{:.2}s ({} samples)",
+                i + 1,
+                segments.len(),
+                seg.start_secs,
+                seg.end_secs,
+                seg_samples.len()
+            );
+
+            let text = self.infer_segment(seg_samples)?;
+            texts.push(text);
+        }
+
+        let combined = texts.join("\n");
+        log::info!("Transcription complete: {} segments, {} chars", texts.len(), combined.len());
+        Ok((combined, segments))
+    }
+
+    /// Run ASR inference on a single audio segment (f32 16kHz mono samples).
+    fn infer_segment(&self, samples: &[f32]) -> anyhow::Result<String> {
+        let mel_spec = self.mel_extractor.compute(samples);
         let n_mels = mel_spec.len();
         let n_frames = mel_spec[0].len();
         let flat: Vec<f32> = mel_spec.into_iter().flatten().collect();
-        log::info!(
-            "Mel: {n_mels} bins x {n_frames} frames, mean={:.4}, min={:.4}, max={:.4}",
-            flat.iter().sum::<f32>() / flat.len() as f32,
-            flat.iter().fold(f32::MAX, |a, &b| a.min(b)),
-            flat.iter().fold(f32::MIN, |a, &b| a.max(b))
-        );
+        log::info!("Mel: {n_mels} bins x {n_frames} frames");
         let mel_tensor = Tensor::<B, 1>::from_floats(flat.as_slice(), &self.device)
             .reshape([1, n_mels, n_frames]);
 
         let audio_features = self.model.thinker.audio_tower.forward(mel_tensor);
         let [_, audio_len, feat_dim] = audio_features.dims();
         log::info!("Audio encoder output: {audio_len} tokens, dim={feat_dim}");
-
-        let feat_flat = audio_features.clone().flatten::<1>(0, 2);
-        let feat_data = feat_flat.into_data();
-        let n_floats = feat_data.bytes.len() / 4;
-        let mut sum = 0.0f64;
-        let mut sum_sq = 0.0f64;
-        let mut lo = f32::MAX;
-        let mut hi = f32::MIN;
-        for i in 0..n_floats.min(1000) {
-            let v = f32::from_le_bytes([
-                feat_data.bytes[i * 4],
-                feat_data.bytes[i * 4 + 1],
-                feat_data.bytes[i * 4 + 2],
-                feat_data.bytes[i * 4 + 3],
-            ]);
-            sum += v as f64;
-            sum_sq += (v as f64) * (v as f64);
-            lo = lo.min(v);
-            hi = hi.max(v);
-        }
-        let n = n_floats.min(1000) as f64;
-        let mean = sum / n;
-        let std = (sum_sq / n - mean * mean).sqrt();
-        log::info!("Audio features stats: mean={mean:.4}, std={std:.4}, range=[{lo:.4}, {hi:.4}]");
-
-        let feat_data = audio_features.clone().flatten::<1>(0, 2).into_data();
-        let bytes = &feat_data.bytes;
-        if bytes.len() >= 4 {
-            let f0 = f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-            let fn_ = f32::from_le_bytes([
-                bytes[bytes.len() - 4],
-                bytes[bytes.len() - 3],
-                bytes[bytes.len() - 2],
-                bytes[bytes.len() - 1],
-            ]);
-            log::info!("Audio features: first={f0:.4}, last={fn_:.4}");
-        }
 
         let prefix_ids = self.build_prefix_ids();
         let suffix_ids = self.build_suffix_ids();
@@ -173,7 +209,6 @@ impl<B: Backend> AsrPipeline<B> {
 
             if self.eos_token_ids.contains(&next_token_id) || next_token_id == self.tokenizer.im_end
             {
-                log::info!("EOS token {next_token_id} at step {step}");
                 break;
             }
 
@@ -195,18 +230,13 @@ impl<B: Backend> AsrPipeline<B> {
             last_logits = logits.reshape([1, vocab_size]);
             current_pos += 1;
 
-            if step < 3 {
-                let raw = &token_data.bytes;
-                log::info!(
-                    "Token {step}: bytes={:02x?}, id={next_token_id}, text={}",
-                    &raw[..4.min(raw.len())],
-                    self.tokenizer.decode(&[next_token_id])
-                );
+            if step < 2 {
+                log::info!("Token {step}: id={next_token_id}");
             }
         }
 
         let text = self.tokenizer.decode(&generated);
-        log::info!("Generated {} tokens, text: {}", generated.len(), text);
+        log::info!("Segment: {} tokens → {}", generated.len(), text.trim());
         Ok(text.trim().to_string())
     }
 

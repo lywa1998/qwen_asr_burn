@@ -1,3 +1,5 @@
+#![cfg_attr(feature = "metal", recursion_limit = "256")]
+
 mod align_pipeline;
 mod audio;
 mod config;
@@ -5,18 +7,30 @@ mod model;
 mod pipeline;
 mod text_processor;
 mod tokenizer;
+mod vad;
+mod video;
 
 use align_pipeline::AlignPipeline;
-use burn::backend::{cuda::CudaDevice, Cuda};
-use burn::tensor::bf16;
 use clap::Parser;
 use pipeline::AsrPipeline;
+
+#[cfg(feature = "cuda")]
+use burn::{backend::{cuda::CudaDevice, Cuda}, tensor::bf16};
+
+#[cfg(feature = "metal")]
+use burn::backend::{wgpu::WgpuDevice, Wgpu};
+
+#[cfg(feature = "cuda")]
+type Backend = Cuda<bf16, i32>;
+
+#[cfg(feature = "metal")]
+type Backend = Wgpu<f32, i32>;
 
 #[derive(Parser)]
 #[command(
     name = "qwen-asr",
     version,
-    about = "Qwen3-ASR with Burn + CUDA (BF16)"
+    about = "Qwen3-ASR with Burn (BF16)"
 )]
 struct Cli {
     #[arg(short, long, default_value = "Qwen3-ASR-0.6B")]
@@ -28,40 +42,68 @@ struct Cli {
 
 #[derive(clap::Subcommand)]
 enum Command {
+    /// Transcribe speech to text from a WAV file
     Transcribe {
+        /// Input WAV file (16kHz mono recommended)
         input: String,
+        /// Output text file (default: stdout)
         #[arg(short, long)]
         output: Option<String>,
     },
+    /// Force-align text to audio, producing word-level timestamps
     Align {
+        /// Input WAV file
         #[arg(short, long)]
         input: String,
+        /// Text to align with the audio
         #[arg(short, long)]
         text: String,
+        /// Language for word splitting (Chinese, English, etc.)
         #[arg(short, long, default_value = "English")]
         language: String,
+        /// Output format: "text" or "json"
         #[arg(short = 'F', long, default_value = "text")]
         format: String,
     },
+    /// Extract 16kHz mono audio from a video file
+    Extract {
+        /// Input video file (mp4, mkv, avi, etc.)
+        input: String,
+        /// Output WAV file (default: <input_stem>.wav)
+        #[arg(short, long)]
+        output: Option<String>,
+    },
 }
-
-type Backend = Cuda<bf16, i32>;
 
 fn main() -> anyhow::Result<()> {
     env_logger::init();
     let cli = Cli::parse();
 
+    #[cfg(feature = "cuda")]
     let device = CudaDevice::default();
+    #[cfg(feature = "metal")]
+    let device = WgpuDevice::default();
 
     match cli.command {
         Command::Transcribe { input, output } => {
             log::info!("Initializing Qwen3-ASR...");
             let pipeline = AsrPipeline::<Backend>::new(&cli.model_dir, device)?;
             log::info!("Transcribing: {}", input);
-            let text = pipeline.transcribe(&input)?;
+            let (text, segments) = pipeline.transcribe(&input)?;
             println!("{text}");
-            if let Some(out_path) = output {
-                std::fs::write(&out_path, &text)?;
+
+            let stem = std::path::Path::new(&input)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("output");
+            let out_path = output.unwrap_or_else(|| format!("{stem}_transcript.txt"));
+            std::fs::write(&out_path, &text)?;
+            log::info!("Wrote transcript to {out_path}");
+
+            if !segments.is_empty() {
+                let seg_path = format!("{stem}_segments.json");
+                std::fs::write(&seg_path, serde_json::to_string_pretty(&segments)?)?;
+                log::info!("Wrote {} segments to {seg_path}", segments.len());
             }
         }
         Command::Align {
@@ -85,6 +127,20 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
             }
+        }
+        Command::Extract { input, output } => {
+            let output_path = output.unwrap_or_else(|| {
+                let stem = std::path::Path::new(&input)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("audio");
+                format!("{stem}.wav")
+            });
+            log::info!("Extracting audio from: {input}");
+            let samples = video::extract_audio(&input)?;
+            video::save_audio_wav(&samples, &output_path)?;
+            let duration = samples.len() as f64 / 16_000.0;
+            println!("Extracted {:.2}s audio → {output_path}", duration);
         }
     }
     Ok(())
