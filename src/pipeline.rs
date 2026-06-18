@@ -108,71 +108,84 @@ impl<B: Backend> AsrPipeline<B> {
         })
     }
 
-    pub fn transcribe(&self, wav_path: &str) -> anyhow::Result<(String, Vec<vad::VoiceSegment>)> {
+    pub fn transcribe(&self, wav_path: &str, language: Option<&str>, context: &str) -> anyhow::Result<(Vec<String>, Vec<vad::VoiceSegment>)> {
         log::info!("Loading audio: {}", wav_path);
 
         let samples = audio::load_wav_samples(wav_path)?;
         let segments = vad::detect_segments(&samples);
 
         if segments.is_empty() {
-            // Fallback: no voice detected, still try full audio
-            let text = self.infer_segment(&samples)?;
-            log::info!("Transcription complete: {} chars", text.len());
-            return Ok((text, vec![]));
+            let audio_features = self.preprocess_audio(&samples)?;
+            let text = self.infer_segment(&audio_features, language, context)?;
+            return Ok((vec![text], vec![]));
         }
 
         log::info!("Transcribing {} voice segments", segments.len());
-        let mut texts: Vec<String> = Vec::new();
 
-        for (i, seg) in segments.iter().enumerate() {
+        // Phase 1: extract + pad audio for all segments, compute mel, batch through
+        // audio encoder. The audio encoder is non-autoregressive so batching
+        // significantly reduces total wall time.
+        let batch_size = segments.len();
+        let mut all_mel_flat: Vec<f32> = Vec::with_capacity(batch_size * 128 * 3000);
+        for seg in &segments {
             let start_sample = (seg.start_secs * 16_000.0) as usize;
             let end_sample = (seg.end_secs * 16_000.0) as usize;
             let seg_samples = &samples[start_sample.min(samples.len())..end_sample.min(samples.len())];
+            let padded = audio::pad_to_30s(seg_samples);
+            let mel = self.mel_extractor.compute(&padded);
+            all_mel_flat.extend(mel.into_iter().flatten());
+        }
+        log::info!(
+            "Batch audio encoding: {} segments, {} mel frames",
+            batch_size,
+            all_mel_flat.len() / 128
+        );
+        let mel_tensor = Tensor::<B, 1>::from_floats(all_mel_flat.as_slice(), &self.device)
+            .reshape([batch_size, 128, 3000]);
+        let all_audio_features = self.model.thinker.audio_tower.forward(mel_tensor);
+        let [_, num_audio_tokens, feat_dim] = all_audio_features.dims();
 
+        // Phase 2: text generation per segment (autoregressive, cannot batch)
+        // Note: Tensor::clone() is shallow (Arc ref-count), so cloning the
+        // full batch for each slice is cheap — no data copy.
+        let mut texts: Vec<String> = Vec::new();
+        let af = all_audio_features;
+        for (i, seg) in segments.iter().enumerate() {
+            let audio_features = af.clone().slice([i..i + 1, 0..num_audio_tokens, 0..feat_dim]);
             log::info!(
-                "Segment {}/{}: {:.2}s-{:.2}s ({} samples)",
+                "Segment {}/{}: {:.2}s-{:.2}s",
                 i + 1,
-                segments.len(),
+                batch_size,
                 seg.start_secs,
                 seg.end_secs,
-                seg_samples.len()
             );
-
-            let text = self.infer_segment(seg_samples)?;
+            let text = self.infer_segment(&audio_features, language, context)?;
             texts.push(text);
         }
 
-        let combined = texts.join("\n");
-        log::info!("Transcription complete: {} segments, {} chars", texts.len(), combined.len());
-        Ok((combined, segments))
+        Ok((texts, segments))
     }
 
-    /// Run ASR inference on a single audio segment (f32 16kHz mono samples).
-    fn infer_segment(&self, samples: &[f32]) -> anyhow::Result<String> {
-        // Pad audio to exactly 30 seconds (480000 samples @ 16kHz) to match
-        // WhisperFeatureExtractor behavior. The model expects exactly 3000 mel
-        // frames per segment.
-        const TARGET_SAMPLES: usize = 480_000; // 30s @ 16kHz
-        let padded: Vec<f32> = if samples.len() < TARGET_SAMPLES {
-            let mut v = samples.to_vec();
-            v.resize(TARGET_SAMPLES, 0.0);
-            v
-        } else if samples.len() > TARGET_SAMPLES {
-            samples[..TARGET_SAMPLES].to_vec()
-        } else {
-            samples.to_vec()
-        };
-        let mel_spec = self.mel_extractor.compute(&padded);
-        let n_mels = mel_spec.len();
-        let n_frames = mel_spec[0].len();
-        let flat: Vec<f32> = mel_spec.into_iter().flatten().collect();
-        log::info!("Mel: {n_mels} bins x {n_frames} frames (padded to {TARGET_SAMPLES} samples)");
+    /// Compute mel + audio encoder features for raw samples. Used when VAD
+    /// finds no voice segments (full-audio fallback).
+    fn preprocess_audio(&self, samples: &[f32]) -> anyhow::Result<Tensor<B, 3>> {
+        let padded = audio::pad_to_30s(samples);
+        let mel = self.mel_extractor.compute(&padded);
+        let (n_mels, n_frames) = (mel.len(), mel[0].len());
+        let flat: Vec<f32> = mel.into_iter().flatten().collect();
         let mel_tensor = Tensor::<B, 1>::from_floats(flat.as_slice(), &self.device)
             .reshape([1, n_mels, n_frames]);
+        Ok(self.model.thinker.audio_tower.forward(mel_tensor))
+    }
 
-        let audio_features = self.model.thinker.audio_tower.forward(mel_tensor);
-        let [_, num_audio_tokens, feat_dim] = audio_features.dims();
-        log::info!("Audio encoder output: {num_audio_tokens} tokens, dim={feat_dim}");
+    /// Run text generation on a single segment with pre-computed audio features.
+    fn infer_segment(
+        &self,
+        audio_features: &Tensor<B, 3>,
+        language: Option<&str>,
+        context: &str,
+    ) -> anyhow::Result<String> {
+        let [_, num_audio_tokens, _feat_dim] = audio_features.dims();
 
 
         // Build full prompt: prefix + audio_pad * N + suffix, then replace
@@ -181,8 +194,16 @@ impl<B: Backend> AsrPipeline<B> {
         //   <|im_start|>system\n...<|im_end|>\n<|im_start|>user\n<|audio_start|>
         //   <|audio_pad|> * N
         //   <|audio_end|><|im_end|>\n<|im_start|>assistant\n
-        let prefix_ids = self.build_prefix_ids();
-        let suffix_ids = self.build_suffix_ids();
+        let prefix_ids = self.build_prefix_ids(context);
+        let mut suffix_ids = self.build_suffix_ids();
+
+        // When language is forced, append "language X<asr_text>" to the prompt
+        // so the model skips language detection and outputs only the transcription.
+        if let Some(lang) = language {
+            let force_text = format!("language {}<asr_text>", lang);
+            suffix_ids.extend(self.tokenizer.encode(&force_text));
+        }
+
         let before_len = prefix_ids.len();
         let after_start = before_len + num_audio_tokens;
 
@@ -199,9 +220,9 @@ impl<B: Backend> AsrPipeline<B> {
         let after_embeds = self.model.thinker.model.embed_tokens.forward(after_t);
 
         let current_embeds =
-            Tensor::cat(vec![before_embeds, audio_features, after_embeds], 1);
+            Tensor::cat(vec![before_embeds, audio_features.clone(), after_embeds], 1);
 
-        let max_new = 512;
+        let max_new = 256;
         let seq_len = current_embeds.dims()[1];
         let total_positions: Vec<usize> = (0..(seq_len + max_new)).collect();
         let mut kv_cache = KvCache::new(self.model.thinker.model.layers.len());
@@ -243,7 +264,6 @@ impl<B: Backend> AsrPipeline<B> {
                 let last5: Vec<u32> = generated[generated.len() - 5..].to_vec();
                 let (a, b, c, d, e) = (last5[0], last5[1], last5[2], last5[3], last5[4]);
                 if a == c && c == e && b == d && a == next_token_id {
-                    // Detected bigram loop → stop
                     break;
                 }
             }
@@ -266,9 +286,6 @@ impl<B: Backend> AsrPipeline<B> {
             last_logits = logits.reshape([1, vocab_size]);
             current_pos += 1;
 
-            if step < 4 {
-                log::info!("Token {step}: id={next_token_id}");
-            }
             // Check for pattern repetition every 16 steps
             if step > 0 && step % 16 == 0 && generated.len() >= 20 {
                 let half = generated.len() / 2;
@@ -321,10 +338,10 @@ impl<B: Backend> AsrPipeline<B> {
     /// Fix repetition loops common in greedy ASR decoding.
     /// Ported from Qwen3-ASR Python reference (detect_and_fix_repetitions).
     fn fix_repetitions(&self, text: &str) -> String {
-        let threshold: usize = 20;
+        let char_repeat_threshold: usize = 20;
         let chars: Vec<char> = text.chars().collect();
         let n = chars.len();
-        if n < threshold * 2 {
+        if n < char_repeat_threshold * 2 {
             return text.to_string();
         }
 
@@ -336,7 +353,7 @@ impl<B: Backend> AsrPipeline<B> {
             while i + count < n && chars[i + count] == chars[i] {
                 count += 1;
             }
-            if count > threshold {
+            if count > char_repeat_threshold {
                 fixed_chars.push(chars[i]);
                 i += count;
             } else {
@@ -348,25 +365,25 @@ impl<B: Backend> AsrPipeline<B> {
         }
 
         // Phase 2: fix pattern repeats at character level
-        let threshold = 15usize;
+        let pattern_repeat_threshold = 15usize;
         let max_pat = 8usize;
         let s = fixed_chars;
         let n = s.len();
-        if n < threshold * 2 {
+        if n < pattern_repeat_threshold * 2 {
             return s.iter().collect();
         }
 
         let mut result: Vec<char> = Vec::with_capacity(n);
         let mut i = 0;
-        while i + threshold * 2 <= n {
+        while i + pattern_repeat_threshold * 2 <= n {
             let mut found = false;
             for k in 1..=max_pat {
-                if i + k * threshold > n {
+                if i + k * pattern_repeat_threshold > n {
                     break;
                 }
                 let pattern = &s[i..i + k];
                 let mut all_match = true;
-                for rep in 1..threshold {
+                for rep in 1..pattern_repeat_threshold {
                     let start = i + rep * k;
                     if &s[start..start + k] != pattern {
                         all_match = false;
@@ -375,7 +392,7 @@ impl<B: Backend> AsrPipeline<B> {
                 }
                 if all_match {
                     result.extend_from_slice(pattern);
-                    i += threshold * k;
+                    i += pattern_repeat_threshold * k;
                     found = true;
                     break;
                 }
@@ -394,9 +411,12 @@ impl<B: Backend> AsrPipeline<B> {
         result.iter().collect()
     }
 
-    fn build_prefix_ids(&self) -> Vec<u32> {
+    fn build_prefix_ids(&self, context: &str) -> Vec<u32> {
         let mut prefix_ids = vec![self.tokenizer.im_start];
         prefix_ids.extend(self.tokenizer.encode("system\n"));
+        if !context.is_empty() {
+            prefix_ids.extend(self.tokenizer.encode(context));
+        }
         prefix_ids.push(self.tokenizer.im_end);
         prefix_ids.extend(self.tokenizer.encode("\n"));
         prefix_ids.push(self.tokenizer.im_start);

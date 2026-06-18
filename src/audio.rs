@@ -83,10 +83,21 @@ impl MelSpectrogram {
         result
     }
 
-    /// Compute mel spectrogram from a WAV file path (loads & resamples internally).
-    pub fn compute_from_wav(&self, wav_path: &str) -> anyhow::Result<Vec<Vec<f32>>> {
-        let resampled = load_wav_samples(wav_path)?;
-        Ok(self.compute(&resampled))
+}
+
+/// Pad or truncate audio to exactly 30 seconds (480,000 samples @ 16kHz).
+/// The model was trained with WhisperFeatureExtractor which always produces
+/// exactly 3000 mel frames (n_samples=480000).
+pub fn pad_to_30s(samples: &[f32]) -> Vec<f32> {
+    const TARGET: usize = 480_000;
+    if samples.len() < TARGET {
+        let mut v = samples.to_vec();
+        v.resize(TARGET, 0.0);
+        v
+    } else if samples.len() > TARGET {
+        samples[..TARGET].to_vec()
+    } else {
+        samples.to_vec()
     }
 }
 

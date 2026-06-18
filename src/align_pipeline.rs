@@ -1,7 +1,7 @@
 use burn::tensor::backend::Backend;
 use burn::tensor::{Int, Tensor};
 
-use crate::audio::MelSpectrogram;
+use crate::audio::{self, MelSpectrogram};
 use crate::config::{ForcedAlignerConfig, PreprocessorConfig};
 use crate::model::{self, create_mrope, Qwen3ASR, Qwen3ASRConfig};
 #[cfg(feature = "metal")]
@@ -95,18 +95,21 @@ impl<B: Backend> AlignPipeline<B> {
         text: &str,
         language: &str,
     ) -> anyhow::Result<Vec<TimestampItem>> {
-        // 1. Load and preprocess audio
-        let mel_spec = self.mel_extractor.compute_from_wav(audio_path)?;
+        // 1. Load, resample, and pad audio to 30s
+        let samples = audio::load_wav_samples(audio_path)?;
+        let padded = audio::pad_to_30s(&samples);
+        let mel_spec = self.mel_extractor.compute(&padded);
         let n_mels = mel_spec.len();
         let n_frames = mel_spec[0].len();
         let flat: Vec<f32> = mel_spec.into_iter().flatten().collect();
+        log::info!("Mel: {n_mels} bins x {n_frames} frames (padded to 30s)");
         let mel_tensor = Tensor::<B, 1>::from_floats(flat.as_slice(), &self.device)
             .reshape([1, n_mels, n_frames]);
 
-        // 2. Run audio encoder to get feature frames
+        // 2. Run audio encoder
         let audio_features = self.model.thinker.audio_tower.forward(mel_tensor);
         let t_audio = audio_features.dims()[1];
-        log::info!("Audio encoder output: {} frames", t_audio);
+        log::info!("Audio encoder output: {} tokens", t_audio);
 
         // 3. Format text with timestamp markers
         let (word_list, formatted_text) = text_processor::encode_timestamp(text, language);

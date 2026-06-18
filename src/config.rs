@@ -15,6 +15,7 @@ pub struct ThinkerConfigRaw {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct AudioEncoderConfig {
     pub d_model: usize,
     pub encoder_attention_heads: usize,
@@ -28,6 +29,7 @@ pub struct AudioEncoderConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct TextConfig {
     pub hidden_size: usize,
     pub num_attention_heads: usize,
@@ -56,6 +58,7 @@ pub struct RopeScalingConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct PreprocessorConfig {
     pub feature_size: usize,
     pub n_fft: usize,
@@ -68,6 +71,7 @@ pub struct PreprocessorConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct GenerationConfig {
     pub eos_token_id: Vec<u32>,
     pub pad_token_id: u32,
@@ -109,6 +113,7 @@ pub struct ForcedAlignerConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct ForcedAlignerThinkerConfig {
     pub audio_config: AudioEncoderConfig,
     pub text_config: TextConfig,

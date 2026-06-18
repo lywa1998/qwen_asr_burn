@@ -81,8 +81,8 @@ pub fn parse_timestamp(words: &[String], timestamps: &[f64]) -> Vec<TimestampIte
             let end = timestamps.get(i * 2 + 1).copied().unwrap_or(0.0);
             TimestampItem {
                 text: word.clone(),
-                start_time: (start / 1000.0 * 1000.0).round() / 1000.0,
-                end_time: (end / 1000.0 * 1000.0).round() / 1000.0,
+                start_time: start / 1000.0,
+                end_time: end / 1000.0,
             }
         })
         .collect()
@@ -122,35 +122,39 @@ pub fn fix_timestamp(data: &[f64]) -> Vec<f64> {
 
         let anomaly_len = j - i;
 
+        let left_val = if i > 0 { Some(result[i - 1]) } else { None };
+        let right_val = if j < data.len() { Some(result[j]) } else { None };
+
         if anomaly_len <= 2 {
             for k in i..j {
-                let left_val = if i > 0 {
-                    result[i - 1]
-                } else {
-                    result[j]
-                };
-                let right_val = if j < data.len() {
-                    result[j]
-                } else {
-                    result[i - 1]
-                };
-                let ratio = (k - i + 1) as f64 / (anomaly_len + 1) as f64;
-                result[k] = left_val + (right_val - left_val) * ratio;
+                match (left_val, right_val) {
+                    (None, Some(rv)) => result[k] = rv,
+                    (Some(lv), None) => result[k] = lv,
+                    (Some(lv), Some(rv)) => {
+                        result[k] = if (k as isize - (i as isize - 1)) <= (j as isize - k as isize) {
+                            lv
+                        } else {
+                            rv
+                        };
+                    }
+                    _ => {}
+                }
             }
         } else {
-            let left_val = if i > 0 {
-                result[i - 1]
-            } else {
-                data[i]
-            };
-            let right_val = if j < data.len() {
-                result[j]
-            } else {
-                data[j - 1]
-            };
-            for k in i..j {
-                let ratio = (k - i + 1) as f64 / (anomaly_len + 1) as f64;
-                result[k] = left_val + (right_val - left_val) * ratio;
+            match (left_val, right_val) {
+                (Some(lv), Some(rv)) => {
+                    let step = (rv - lv) / (anomaly_len + 1) as f64;
+                    for (idx, k) in (i..j).enumerate() {
+                        result[k] = lv + step * (idx + 1) as f64;
+                    }
+                }
+                (Some(lv), None) => {
+                    for k in i..j { result[k] = lv; }
+                }
+                (None, Some(rv)) => {
+                    for k in i..j { result[k] = rv; }
+                }
+                _ => {}
             }
         }
 

@@ -5,6 +5,7 @@ mod audio;
 mod config;
 mod model;
 mod pipeline;
+mod srt;
 mod text_processor;
 mod tokenizer;
 mod vad;
@@ -46,9 +47,18 @@ enum Command {
     Transcribe {
         /// Input WAV file (16kHz mono recommended)
         input: String,
-        /// Output text file (default: stdout)
+        /// Output text file (default: <input_stem>_transcript.txt)
         #[arg(short, long)]
         output: Option<String>,
+        /// Force language (e.g. "Chinese", "English"). Skips language detection.
+        #[arg(short, long)]
+        language: Option<String>,
+        /// Context string for the system prompt (e.g. "You are a transcription expert.")
+        #[arg(short, long, default_value = "")]
+        context: String,
+        /// Save SRT subtitle file alongside transcript
+        #[arg(long)]
+        save_srt: bool,
     },
     /// Force-align text to audio, producing word-level timestamps
     Align {
@@ -85,25 +95,31 @@ fn main() -> anyhow::Result<()> {
     let device = WgpuDevice::default();
 
     match cli.command {
-        Command::Transcribe { input, output } => {
+        Command::Transcribe { input, output, language, context, save_srt } => {
             log::info!("Initializing Qwen3-ASR...");
             let pipeline = AsrPipeline::<Backend>::new(&cli.model_dir, device)?;
-            log::info!("Transcribing: {}", input);
-            let (text, segments) = pipeline.transcribe(&input)?;
-            println!("{text}");
+            log::info!("Transcribing: {} (language={:?})", input, language);
+            let (texts, segments) = pipeline.transcribe(&input, language.as_deref(), &context)?;
+            let combined = texts.join("\n");
+            println!("{combined}");
 
             let stem = std::path::Path::new(&input)
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or("output");
             let out_path = output.unwrap_or_else(|| format!("{stem}_transcript.txt"));
-            std::fs::write(&out_path, &text)?;
+            std::fs::write(&out_path, &combined)?;
             log::info!("Wrote transcript to {out_path}");
 
             if !segments.is_empty() {
                 let seg_path = format!("{stem}_segments.json");
                 std::fs::write(&seg_path, serde_json::to_string_pretty(&segments)?)?;
                 log::info!("Wrote {} segments to {seg_path}", segments.len());
+            }
+
+            if save_srt && !segments.is_empty() {
+                let srt_path = format!("{stem}.srt");
+                srt::write_srt(&segments, &texts, &srt_path)?;
             }
         }
         Command::Align {

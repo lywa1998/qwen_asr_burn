@@ -1,5 +1,47 @@
 # Issues Found During Qwen3-ASR Burn Implementation
 
+## Open Issues (待验证)
+
+### Metal/wgpu vs PyTorch Generation Divergence
+
+**Symptom:** Same 0.6B model, Python (PyTorch CPU F32) outputs "Pocket四P", Rust (Metal/wgpu F32) outputs "抛弃四期". Using Python's exact mel features does NOT fix the issue — generation diverges at token ~10 within the first 32 tokens.
+
+**Hypothesis:** Numerical differences in the wgpu/Metal backend (softmax, layer norm, attention) accumulate across 28 layers, causing different logit rankings at the same position. This is a cross-backend precision issue, not a code bug.
+
+**Verification plan:** Switch to CUDA/BF16 backend and compare output with Python (also BF16). If CUDA matches Python → confirms wgpu precision issue. If CUDA also diverges → bug in model implementation or generation loop.
+
+**Status:** 待 CUDA 验证
+
+### qwen-asr PyPI `fix_mistral_regex` Crash
+
+**Symptom:** `TypeError: 'ByteLevel' object does not support item assignment` when calling `Qwen3ASRModel.from_pretrained()`.
+
+**Root cause:** qwen-asr hardcodes `fix_mistral_regex=True` in `AutoProcessor.from_pretrained()`. transformers 4.57.3+ applies regex check to all non-Split tokenizers (#44031). Qwen uses ByteLevel pre-tokenizer which doesn't support item assignment.
+
+**Fix:** Manually removed 3 occurrences in `.venv/lib/.../qwen_asr/`. Upstream fix pending.
+
+**Refs:** [transformers#44031](https://github.com/huggingface/transformers/issues/44031), [transformers#42299](https://github.com/huggingface/transformers/pull/42299)
+
+**Status:** Local workaround applied
+
+### F16 Precision Not Viable on Metal
+
+**Symptom:** `Wgpu<f16, i32>` generates empty/invalid tokens (id=198 loop). BF16→F16 weight conversion causes overflow (BF16 exponent range ≈ F32, F16 much narrower).
+
+**Conclusion:** Metal must use F32. H16 not supported for this model's BF16-trained weights.
+
+**Status:** Verified. Stick with F32 permanently.
+
+### Greedy Decoding Repetition
+
+**Symptom:** With max_new=256, segments often generate 256 tokens without hitting EOS, with repeating patterns in later tokens.
+
+**Mitigation:** `fix_repetitions()` post-processing + bigram loop detection. Python reference also has this issue and uses `detect_and_fix_repetitions()`.
+
+**Status:** Mitigated but not fully resolved. CUDA may improve.
+
+---
+
 ## Resolved Issues
 
 ### 1. Missing `<|im_start|>` Token Before Assistant Turn

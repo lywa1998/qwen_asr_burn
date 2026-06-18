@@ -3,12 +3,9 @@ use tokenizers::Tokenizer;
 
 pub struct Qwen2Tokenizer {
     pub tokenizer: Tokenizer,
-    pub audio_start: u32,
-    pub audio_end: u32,
     pub audio_pad: u32,
     pub im_start: u32,
     pub im_end: u32,
-    pub eos_token_id: u32,
     /// `<timestamp>` is only used by the forced-aligner pipeline. The ASR
     /// tokenizer.json does not contain it, so it is loaded lazily and may be
     /// `None` when transcribing.
@@ -22,17 +19,14 @@ impl Qwen2Tokenizer {
             .map_err(|e| anyhow::anyhow!("Failed to load tokenizer.json: {}", e))?;
 
         let audio_pad_id = required_token_id(&tokenizer, "<|audio_pad|>")?;
-        let audio_start_id = required_token_id(&tokenizer, "<|audio_start|>")?;
-        let audio_end_id = required_token_id(&tokenizer, "<|audio_end|>")?;
         let im_start_id = required_token_id(&tokenizer, "<|im_start|>")?;
         let im_end_id = required_token_id(&tokenizer, "<|im_end|>")?;
-        let eos_id = required_token_id(&tokenizer, "<|endoftext|>")?;
         // `<timestamp>` only exists in the forced-aligner tokenizer.json; the
         // ASR tokenizer.json intentionally omits it.
         let timestamp_id = tokenizer.token_to_id("<timestamp>");
 
-        log::info!("Audio tokens: start={audio_start_id}, end={audio_end_id}, pad={audio_pad_id}");
-        log::info!("Chat tokens: im_start={im_start_id}, im_end={im_end_id}, eos={eos_id}");
+        log::info!("Audio pad token: id={audio_pad_id}");
+        log::info!("Chat tokens: im_start={im_start_id}, im_end={im_end_id}");
         if let Some(id) = timestamp_id {
             log::info!("Timestamp token: <timestamp>={id}");
         } else {
@@ -41,12 +35,9 @@ impl Qwen2Tokenizer {
 
         Ok(Self {
             tokenizer,
-            audio_start: audio_start_id,
-            audio_end: audio_end_id,
             audio_pad: audio_pad_id,
             im_start: im_start_id,
             im_end: im_end_id,
-            eos_token_id: eos_id,
             timestamp_id,
         })
     }
