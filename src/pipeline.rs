@@ -1,11 +1,8 @@
+use std::rc::Rc;
+
+use burn::tensor::DType;
 use burn::tensor::backend::Backend;
 use burn::tensor::{Int, Tensor};
-
-#[cfg(feature = "metal")]
-use std::rc::Rc;
-#[cfg(feature = "metal")]
-use burn::tensor::DType;
-#[cfg(feature = "metal")]
 use burn_store::{ModuleAdapter, TensorSnapshot};
 
 use crate::audio::{self, MelSpectrogram};
@@ -15,11 +12,9 @@ use crate::tokenizer::Qwen2Tokenizer;
 use crate::vad;
 
 /// Converts BF16 weights to F32 during loading (for backends that don't support BF16).
-#[cfg(feature = "metal")]
 #[derive(Clone)]
 pub(crate) struct Bf16ToF32Adapter;
 
-#[cfg(feature = "metal")]
 impl ModuleAdapter for Bf16ToF32Adapter {
     fn adapt(&self, snapshot: &TensorSnapshot) -> TensorSnapshot {
         if snapshot.dtype != DType::BF16 {
@@ -72,9 +67,10 @@ impl<B: Backend> AsrPipeline<B> {
         let weights_path = format!("{}/model.safetensors", model_dir);
         {
             use burn_store::{ChainAdapter, ModuleSnapshot, PyTorchToBurnAdapter, SafetensorsStore};
-            #[cfg(feature = "metal")]
+            // Model weights are stored as BF16.
+            #[cfg(not(feature = "bf16"))]
             let adapter = ChainAdapter::new(PyTorchToBurnAdapter, Bf16ToF32Adapter);
-            #[cfg(not(feature = "metal"))]
+            #[cfg(feature = "bf16")]
             let adapter = PyTorchToBurnAdapter;
             let mut store = SafetensorsStore::from_file(&weights_path)
                 .with_from_adapter(adapter);
@@ -140,10 +136,65 @@ impl<B: Backend> AsrPipeline<B> {
             batch_size,
             all_mel_flat.len() / 128
         );
+        // Load WhisperFE mel directly for definitive comparison
+        let use_whisper_mel = std::fs::read("/tmp/whisper_mel.bin")
+            .map(|bytes| {
+                let floats: Vec<f32> = bytes.chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect();
+                floats
+            })
+            .ok()
+            .filter(|f| f.len() == 128 * 3000);
+
+        if let Some(ref whisper_flat) = use_whisper_mel {
+            log::info!("Using WhisperFE mel directly (bypassing Rust mel computation)");
+            // Run audio encoder on WhisperFE mel
+            let mel_tensor = Tensor::<B, 1>::from_floats(whisper_flat.as_slice(), &self.device)
+                .reshape([batch_size, 128, 3000]);
+            let all_audio_features = self.model.thinker.audio_tower.forward(mel_tensor);
+            let [_, num_audio_tokens, feat_dim] = all_audio_features.dims();
+
+            // Debug audio encoder output
+            {
+                let af0 = all_audio_features.clone().slice([0..1, 0..num_audio_tokens, 0..feat_dim]);
+                let flat = af0.reshape([num_audio_tokens * feat_dim])
+                    .cast(burn::tensor::DType::F32).into_data();
+                let vals: &[f32] = flat.as_slice().unwrap();
+                let mean = vals.iter().sum::<f32>() / vals.len() as f32;
+                let std = (vals.iter().map(|v| (v-mean).powi(2)).sum::<f32>() / vals.len() as f32).sqrt();
+                log::info!("Audio enc (WhisperFE mel): tokens={}, token0[0..4]={:?}, mean={:.4}, std={:.4}",
+                    num_audio_tokens, &vals[..4], mean, std);
+            }
+
+            // Generate text using WhisperFE mel
+            let af = all_audio_features;
+            let mut texts: Vec<String> = Vec::new();
+            for (i, seg) in segments.iter().enumerate() {
+                let audio_features = af.clone().slice([i..i + 1, 0..num_audio_tokens, 0..feat_dim]);
+                log::info!("Segment {}/{}: {:.2}s-{:.2}s", i + 1, batch_size, seg.start_secs, seg.end_secs);
+                let text = self.infer_segment(&audio_features, None, "")?;
+                texts.push(text);
+            }
+            return Ok((texts, segments));
+        }
+
         let mel_tensor = Tensor::<B, 1>::from_floats(all_mel_flat.as_slice(), &self.device)
             .reshape([batch_size, 128, 3000]);
         let all_audio_features = self.model.thinker.audio_tower.forward(mel_tensor);
         let [_, num_audio_tokens, feat_dim] = all_audio_features.dims();
+
+        // Debug audio encoder output (compare with Python reference)
+        {
+            let af0 = all_audio_features.clone().slice([0..1, 0..num_audio_tokens, 0..feat_dim]);
+            let flat = af0.reshape([num_audio_tokens * feat_dim])
+                .cast(burn::tensor::DType::F32).into_data();
+            let vals: &[f32] = flat.as_slice().unwrap();
+            let mean = vals.iter().sum::<f32>() / vals.len() as f32;
+            let std = (vals.iter().map(|v| (v-mean).powi(2)).sum::<f32>() / vals.len() as f32).sqrt();
+            log::info!("Audio enc: tokens={}, token0[0..4]={:?}, mean={:.4}, std={:.4}",
+                num_audio_tokens, &vals[..4], mean, std);
+        }
 
         // Phase 2: text generation per segment (autoregressive, cannot batch)
         // Note: Tensor::clone() is shallow (Arc ref-count), so cloning the
@@ -173,9 +224,49 @@ impl<B: Backend> AsrPipeline<B> {
         let mel = self.mel_extractor.compute(&padded);
         let (n_mels, n_frames) = (mel.len(), mel[0].len());
         let flat: Vec<f32> = mel.into_iter().flatten().collect();
+
+        // Load WhisperFE mel for comparison if available
+        if let Ok(whisper_bytes) = std::fs::read("/tmp/whisper_mel.bin") {
+            if whisper_bytes.len() == n_mels * n_frames * 4 {
+                let whisper_f32: Vec<f32> = whisper_bytes
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect();
+                let mut max_diff = 0.0f32;
+                let mut sum_diff = 0.0f64;
+                for (i, (&a, &b)) in flat.iter().zip(whisper_f32.iter()).enumerate() {
+                    let d = (a - b).abs();
+                    max_diff = max_diff.max(d);
+                    sum_diff += d as f64;
+                }
+                log::info!(
+                    "Mel diff (Rust vs WhisperFE): max={:.4}, mean={:.4}",
+                    max_diff,
+                    sum_diff / flat.len() as f64
+                );
+            }
+        }
+
         let mel_tensor = Tensor::<B, 1>::from_floats(flat.as_slice(), &self.device)
             .reshape([1, n_mels, n_frames]);
-        Ok(self.model.thinker.audio_tower.forward(mel_tensor))
+        let af = self.model.thinker.audio_tower.forward(mel_tensor);
+
+        // Compare audio encoder output with Python reference
+        {
+            let [_, num_tokens, feat_dim] = af.dims();
+            let f32_data = af.clone().reshape([num_tokens * feat_dim])
+                .cast(burn::tensor::DType::F32).into_data();
+            let vals: &[f32] = f32_data.as_slice().unwrap();
+            log::info!(
+                "Audio enc: {} tokens, dim={}, token0[0..4]={:?}, mean={:.4}, std={:.4}",
+                num_tokens, feat_dim,
+                &vals[..4],
+                vals.iter().sum::<f32>() / vals.len() as f32,
+                (vals.iter().map(|v| (v - vals.iter().sum::<f32>() / vals.len() as f32).powi(2)).sum::<f32>() / vals.len() as f32).sqrt(),
+            );
+        }
+
+        Ok(af)
     }
 
     /// Run text generation on a single segment with pre-computed audio features.

@@ -2,15 +2,22 @@
 
 ## Open Issues (待验证)
 
-### Metal/wgpu vs PyTorch Generation Divergence
+### Metal/wgpu vs PyTorch Generation Divergence → 模型实现 Bug
 
-**Symptom:** Same 0.6B model, Python (PyTorch CPU F32) outputs "Pocket四P", Rust (Metal/wgpu F32) outputs "抛弃四期". Using Python's exact mel features does NOT fix the issue — generation diverges at token ~10 within the first 32 tokens.
+**Symptom:** Same 0.6B model, Python (PyTorch CPU F32) outputs correct text, Rust (Metal/wgpu F32) outputs garbled text. Using Python's exact mel features does NOT fix the issue — generation diverges at token ~10.
 
-**Hypothesis:** Numerical differences in the wgpu/Metal backend (softmax, layer norm, attention) accumulate across 28 layers, causing different logit rankings at the same position. This is a cross-backend precision issue, not a code bug.
+**CUDA verification (2026-06-18):** Tested CUDA/BF16 Burn vs Python BF16 on the same segment:
+- **Python BF16:** "这是你打开B站每天可以看到的推荐视频，不管他们在讲的内容有多么不同，它基本都有同一个东西，就是字幕..."
+- **Burn CUDA BF16:** "是你打开B站，每天可以看到推荐视频。不管他们在讲内容多么，还是什么，我给你说一句，就是字幕..."
 
-**Verification plan:** Switch to CUDA/BF16 backend and compare output with Python (also BF16). If CUDA matches Python → confirms wgpu precision issue. If CUDA also diverges → bug in model implementation or generation loop.
+CUDA/BF16 同样存在分歧 → **模型实现中存在 bug，而非后端精度问题。**
 
-**Status:** 待 CUDA 验证
+**Next steps:**
+1. 对比 Burn vs Python 的 prefill top-10 logits（已在调试中确认 top-1 token 相同，但 logit 值存在系统性偏差 ~3-4）
+2. 逐层对比 audio encoder 输出（Token 0 第一值：Burn=0.021 vs Python=0.0015）
+3. 重点检查：MRoPE 实现、SiLU/SwiGLU MLP、RMS/LayerNorm 数值差异
+
+**Status:** 已确认 CUDA 也存在分歧 → 需要排查模型层实现
 
 ### qwen-asr PyPI `fix_mistral_regex` Crash
 
@@ -22,7 +29,7 @@
 
 **Refs:** [transformers#44031](https://github.com/huggingface/transformers/issues/44031), [transformers#42299](https://github.com/huggingface/transformers/pull/42299)
 
-**Status:** Local workaround applied
+**Status:** Local workaround applied (changed to `fix_mistral_regex=False` in 3 files).
 
 ### F16 Precision Not Viable on Metal
 

@@ -454,7 +454,8 @@ impl Qwen3DecoderLayerConfig {
                 self.epsilon,
             )
             .init(device),
-            post_attention_layernorm: MyRmsNormConfig::new(self.hidden_size, self.epsilon).init(device),
+            post_attention_layernorm: MyRmsNormConfig::new(self.hidden_size, self.epsilon)
+                .init(device),
             mlp: Qwen3MLPConfig::new(self.hidden_size, self.intermediate_size).init(device),
         }
     }
@@ -472,7 +473,8 @@ impl<B: Backend> Qwen3DecoderLayer<B> {
         let residual = hidden_states.clone();
         let hidden_states = self.input_layernorm.forward(hidden_states);
         let (hidden_states, new_cache) =
-            self.self_attn.forward(hidden_states, cos, sin, causal_mask, kv_cache);
+            self.self_attn
+                .forward(hidden_states, cos, sin, causal_mask, kv_cache);
         let hidden_states = hidden_states.add(residual);
 
         let residual = hidden_states.clone();
@@ -701,6 +703,7 @@ impl Qwen3ASRAudioEncoderModuleConfig {
             conv2d1: Conv2dConfig::new([1, self.downsample_hidden_size], [3, 3])
                 .with_stride([2, 2])
                 .with_padding(PaddingConfig2d::Explicit(1, 1, 1, 1))
+                .with_bias(true)
                 .init(device),
             conv2d2: Conv2dConfig::new(
                 [self.downsample_hidden_size, self.downsample_hidden_size],
@@ -708,6 +711,7 @@ impl Qwen3ASRAudioEncoderModuleConfig {
             )
             .with_stride([2, 2])
             .with_padding(PaddingConfig2d::Explicit(1, 1, 1, 1))
+            .with_bias(true)
             .init(device),
             conv2d3: Conv2dConfig::new(
                 [self.downsample_hidden_size, self.downsample_hidden_size],
@@ -715,6 +719,7 @@ impl Qwen3ASRAudioEncoderModuleConfig {
             )
             .with_stride([2, 2])
             .with_padding(PaddingConfig2d::Explicit(1, 1, 1, 1))
+            .with_bias(true)
             .init(device),
             conv_out: LinearConfig::new(conv_out_dim, self.d_model)
                 .with_bias(false)
@@ -835,7 +840,10 @@ impl Qwen3ASRThinkerForConditionalGenerationConfig {
         }
     }
 
-    pub fn init<B: Backend>(&self, device: &B::Device) -> Qwen3ASRThinkerForConditionalGeneration<B> {
+    pub fn init<B: Backend>(
+        &self,
+        device: &B::Device,
+    ) -> Qwen3ASRThinkerForConditionalGeneration<B> {
         Qwen3ASRThinkerForConditionalGeneration {
             audio_tower: self.audio_tower.init(device),
             model: self.model.init(device),

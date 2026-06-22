@@ -14,9 +14,34 @@ impl MelSpectrogram {
     pub fn new(n_fft: usize, hop_length: usize, n_mels: usize, sample_rate: u32) -> Self {
         let n_freqs = n_fft / 2 + 1;
         let hann_window = hann_window(n_fft);
-        let mel_filters =
-            create_mel_filterbank(n_mels, n_fft, sample_rate, 0.0, sample_rate as f64 / 2.0);
+
+        // Try loading HF's Whisper mel filterbank (exact match to Python reference).
+        // Falls back to the candle-compatible Slaney filterbank if file not found.
+        let mel_filters = Self::try_load_hf_filterbank(n_mels, n_freqs)
+            .unwrap_or_else(|| {
+                log::info!("Using built-in Slaney mel filterbank (HF filterbank not found)");
+                create_mel_filterbank(n_mels, n_fft, sample_rate, 0.0, sample_rate as f64 / 2.0)
+            });
+
         Self { n_fft, hop_length, num_mel_bins: n_mels, n_freqs, hann_window, mel_filters }
+    }
+
+    /// Try to load HuggingFace's exact Whisper mel filterbank from a pre-saved file.
+    /// The filterbank must be saved as row-major f32: [num_mels × n_freqs].
+    fn try_load_hf_filterbank(num_mels: usize, n_freqs: usize) -> Option<Vec<f32>> {
+        let path = "/tmp/hf_mel_fb.bin";
+        let data = std::fs::read(path).ok()?;
+        let expected = num_mels * n_freqs * 4;
+        if data.len() != expected {
+            log::warn!("HF filterbank size mismatch: got {} bytes, expected {expected}", data.len());
+            return None;
+        }
+        let filters: Vec<f32> = data
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        log::info!("Loaded HF Whisper mel filterbank from {path} ({num_mels}×{n_freqs})");
+        Some(filters)
     }
 
     /// Extract log-mel spectrogram.
