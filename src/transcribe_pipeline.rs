@@ -1,15 +1,14 @@
 use std::rc::Rc;
 
 use burn::tensor::DType;
-use burn::tensor::backend::Backend;
-use burn::tensor::{Int, Tensor};
+use burn::tensor::{Device, Int, Tensor};
 use burn_store::{ModuleAdapter, TensorSnapshot};
 
-use crate::audio::{self, MelSpectrogram};
-use crate::config::{GenerationConfig, ModelConfig, PreprocessorConfig};
-use crate::model::{self, create_mrope, KvCache, Qwen3ASR, Qwen3ASRConfig};
-use crate::tokenizer::Qwen2Tokenizer;
-use crate::vad;
+use crate::models::qwen_asr::config::{GenerationConfig, ModelConfig, PreprocessorConfig};
+use crate::models::qwen_asr::{self as model, create_mrope, KvCache, Qwen3ASR, Qwen3ASRConfig};
+use crate::utils::audio::{self, MelSpectrogram};
+use crate::utils::tokenizer::Qwen2Tokenizer;
+use crate::utils::vad;
 
 /// Converts BF16 weights to F32 during loading (for backends that don't support BF16).
 #[derive(Clone)]
@@ -40,20 +39,20 @@ impl ModuleAdapter for Bf16ToF32Adapter {
     }
 }
 
-pub struct AsrPipeline<B: Backend> {
-    model: Qwen3ASR<B>,
+pub struct TranscribePipeline {
+    model: Qwen3ASR,
     tokenizer: Qwen2Tokenizer,
     mel_extractor: MelSpectrogram,
-    mrope: model::MRoPE,
-    device: B::Device,
+    mrope: model::Qwen3ASRMRoPE,
+    device: Device,
     eos_token_ids: Vec<u32>,
     audio_start_token_id: u32,
     audio_end_token_id: u32,
     audio_token_id: u32,
 }
 
-impl<B: Backend> AsrPipeline<B> {
-    pub fn new(model_dir: &str, device: B::Device) -> anyhow::Result<Self> {
+impl TranscribePipeline {
+    pub fn new(model_dir: &str, device: Device) -> anyhow::Result<Self> {
         let model_config = ModelConfig::from_dir(model_dir)?;
         let preprocessor_config = PreprocessorConfig::from_dir(model_dir)?;
         let generation_config = GenerationConfig::from_dir(model_dir)?;
@@ -66,14 +65,15 @@ impl<B: Backend> AsrPipeline<B> {
 
         let weights_path = format!("{}/model.safetensors", model_dir);
         {
-            use burn_store::{ChainAdapter, ModuleSnapshot, PyTorchToBurnAdapter, SafetensorsStore};
+            use burn_store::{
+                ChainAdapter, ModuleSnapshot, PyTorchToBurnAdapter, SafetensorsStore,
+            };
             // Model weights are stored as BF16.
             #[cfg(not(feature = "bf16"))]
             let adapter = ChainAdapter::new(PyTorchToBurnAdapter, Bf16ToF32Adapter);
             #[cfg(feature = "bf16")]
             let adapter = PyTorchToBurnAdapter;
-            let mut store = SafetensorsStore::from_file(&weights_path)
-                .with_from_adapter(adapter);
+            let mut store = SafetensorsStore::from_file(&weights_path).with_from_adapter(adapter);
             let result = model.load_from(&mut store)?;
             log::info!(
                 "Weight loading: {} applied, {} errors",
@@ -104,7 +104,12 @@ impl<B: Backend> AsrPipeline<B> {
         })
     }
 
-    pub fn transcribe(&self, wav_path: &str, language: Option<&str>, context: &str) -> anyhow::Result<(Vec<String>, Vec<vad::VoiceSegment>)> {
+    pub fn transcribe(
+        &self,
+        wav_path: &str,
+        language: Option<&str>,
+        context: &str,
+    ) -> anyhow::Result<(Vec<String>, Vec<vad::VoiceSegment>)> {
         log::info!("Loading audio: {}", wav_path);
 
         let samples = audio::load_wav_samples(wav_path)?;
@@ -126,7 +131,8 @@ impl<B: Backend> AsrPipeline<B> {
         for seg in &segments {
             let start_sample = (seg.start_secs * 16_000.0) as usize;
             let end_sample = (seg.end_secs * 16_000.0) as usize;
-            let seg_samples = &samples[start_sample.min(samples.len())..end_sample.min(samples.len())];
+            let seg_samples =
+                &samples[start_sample.min(samples.len())..end_sample.min(samples.len())];
             let padded = audio::pad_to_30s(seg_samples);
             let mel = self.mel_extractor.compute(&padded);
             all_mel_flat.extend(mel.into_iter().flatten());
@@ -139,7 +145,8 @@ impl<B: Backend> AsrPipeline<B> {
         // Load WhisperFE mel directly for definitive comparison
         let use_whisper_mel = std::fs::read("/tmp/whisper_mel.bin")
             .map(|bytes| {
-                let floats: Vec<f32> = bytes.chunks_exact(4)
+                let floats: Vec<f32> = bytes
+                    .chunks_exact(4)
                     .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                     .collect();
                 floats
@@ -150,19 +157,26 @@ impl<B: Backend> AsrPipeline<B> {
         if let Some(ref whisper_flat) = use_whisper_mel {
             log::info!("Using WhisperFE mel directly (bypassing Rust mel computation)");
             // Run audio encoder on WhisperFE mel
-            let mel_tensor = Tensor::<B, 1>::from_floats(whisper_flat.as_slice(), &self.device)
+            let mel_tensor = Tensor::<1>::from_floats(whisper_flat.as_slice(), &self.device)
                 .reshape([batch_size, 128, 3000]);
             let all_audio_features = self.model.thinker.audio_tower.forward(mel_tensor);
             let [_, num_audio_tokens, feat_dim] = all_audio_features.dims();
 
             // Debug audio encoder output
             {
-                let af0 = all_audio_features.clone().slice([0..1, 0..num_audio_tokens, 0..feat_dim]);
-                let flat = af0.reshape([num_audio_tokens * feat_dim])
-                    .cast(burn::tensor::DType::F32).into_data();
+                let af0 =
+                    all_audio_features
+                        .clone()
+                        .slice([0..1, 0..num_audio_tokens, 0..feat_dim]);
+                let flat = af0
+                    .reshape([num_audio_tokens * feat_dim])
+                    .cast(burn::tensor::DType::F32)
+                    .into_data();
                 let vals: &[f32] = flat.as_slice().unwrap();
                 let mean = vals.iter().sum::<f32>() / vals.len() as f32;
-                let std = (vals.iter().map(|v| (v-mean).powi(2)).sum::<f32>() / vals.len() as f32).sqrt();
+                let std = (vals.iter().map(|v| (v - mean).powi(2)).sum::<f32>()
+                    / vals.len() as f32)
+                    .sqrt();
                 log::info!("Audio enc (WhisperFE mel): tokens={}, token0[0..4]={:?}, mean={:.4}, std={:.4}",
                     num_audio_tokens, &vals[..4], mean, std);
             }
@@ -171,29 +185,47 @@ impl<B: Backend> AsrPipeline<B> {
             let af = all_audio_features;
             let mut texts: Vec<String> = Vec::new();
             for (i, seg) in segments.iter().enumerate() {
-                let audio_features = af.clone().slice([i..i + 1, 0..num_audio_tokens, 0..feat_dim]);
-                log::info!("Segment {}/{}: {:.2}s-{:.2}s", i + 1, batch_size, seg.start_secs, seg.end_secs);
+                let audio_features = af
+                    .clone()
+                    .slice([i..i + 1, 0..num_audio_tokens, 0..feat_dim]);
+                log::info!(
+                    "Segment {}/{}: {:.2}s-{:.2}s",
+                    i + 1,
+                    batch_size,
+                    seg.start_secs,
+                    seg.end_secs
+                );
                 let text = self.infer_segment(&audio_features, None, "")?;
                 texts.push(text);
             }
             return Ok((texts, segments));
         }
 
-        let mel_tensor = Tensor::<B, 1>::from_floats(all_mel_flat.as_slice(), &self.device)
+        let mel_tensor = Tensor::<1>::from_floats(all_mel_flat.as_slice(), &self.device)
             .reshape([batch_size, 128, 3000]);
         let all_audio_features = self.model.thinker.audio_tower.forward(mel_tensor);
         let [_, num_audio_tokens, feat_dim] = all_audio_features.dims();
 
         // Debug audio encoder output (compare with Python reference)
         {
-            let af0 = all_audio_features.clone().slice([0..1, 0..num_audio_tokens, 0..feat_dim]);
-            let flat = af0.reshape([num_audio_tokens * feat_dim])
-                .cast(burn::tensor::DType::F32).into_data();
+            let af0 = all_audio_features
+                .clone()
+                .slice([0..1, 0..num_audio_tokens, 0..feat_dim]);
+            let flat = af0
+                .reshape([num_audio_tokens * feat_dim])
+                .cast(burn::tensor::DType::F32)
+                .into_data();
             let vals: &[f32] = flat.as_slice().unwrap();
             let mean = vals.iter().sum::<f32>() / vals.len() as f32;
-            let std = (vals.iter().map(|v| (v-mean).powi(2)).sum::<f32>() / vals.len() as f32).sqrt();
-            log::info!("Audio enc: tokens={}, token0[0..4]={:?}, mean={:.4}, std={:.4}",
-                num_audio_tokens, &vals[..4], mean, std);
+            let std =
+                (vals.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / vals.len() as f32).sqrt();
+            log::info!(
+                "Audio enc: tokens={}, token0[0..4]={:?}, mean={:.4}, std={:.4}",
+                num_audio_tokens,
+                &vals[..4],
+                mean,
+                std
+            );
         }
 
         // Phase 2: text generation per segment (autoregressive, cannot batch)
@@ -202,7 +234,9 @@ impl<B: Backend> AsrPipeline<B> {
         let mut texts: Vec<String> = Vec::new();
         let af = all_audio_features;
         for (i, seg) in segments.iter().enumerate() {
-            let audio_features = af.clone().slice([i..i + 1, 0..num_audio_tokens, 0..feat_dim]);
+            let audio_features = af
+                .clone()
+                .slice([i..i + 1, 0..num_audio_tokens, 0..feat_dim]);
             log::info!(
                 "Segment {}/{}: {:.2}s-{:.2}s",
                 i + 1,
@@ -219,7 +253,7 @@ impl<B: Backend> AsrPipeline<B> {
 
     /// Compute mel + audio encoder features for raw samples. Used when VAD
     /// finds no voice segments (full-audio fallback).
-    fn preprocess_audio(&self, samples: &[f32]) -> anyhow::Result<Tensor<B, 3>> {
+    fn preprocess_audio(&self, samples: &[f32]) -> anyhow::Result<Tensor<3>> {
         let padded = audio::pad_to_30s(samples);
         let mel = self.mel_extractor.compute(&padded);
         let (n_mels, n_frames) = (mel.len(), mel[0].len());
@@ -234,7 +268,7 @@ impl<B: Backend> AsrPipeline<B> {
                     .collect();
                 let mut max_diff = 0.0f32;
                 let mut sum_diff = 0.0f64;
-                for (i, (&a, &b)) in flat.iter().zip(whisper_f32.iter()).enumerate() {
+                for (&a, &b) in flat.iter().zip(whisper_f32.iter()) {
                     let d = (a - b).abs();
                     max_diff = max_diff.max(d);
                     sum_diff += d as f64;
@@ -247,22 +281,31 @@ impl<B: Backend> AsrPipeline<B> {
             }
         }
 
-        let mel_tensor = Tensor::<B, 1>::from_floats(flat.as_slice(), &self.device)
-            .reshape([1, n_mels, n_frames]);
+        let mel_tensor =
+            Tensor::<1>::from_floats(flat.as_slice(), &self.device).reshape([1, n_mels, n_frames]);
         let af = self.model.thinker.audio_tower.forward(mel_tensor);
 
         // Compare audio encoder output with Python reference
         {
             let [_, num_tokens, feat_dim] = af.dims();
-            let f32_data = af.clone().reshape([num_tokens * feat_dim])
-                .cast(burn::tensor::DType::F32).into_data();
+            let f32_data = af
+                .clone()
+                .reshape([num_tokens * feat_dim])
+                .cast(burn::tensor::DType::F32)
+                .into_data();
             let vals: &[f32] = f32_data.as_slice().unwrap();
             log::info!(
                 "Audio enc: {} tokens, dim={}, token0[0..4]={:?}, mean={:.4}, std={:.4}",
-                num_tokens, feat_dim,
+                num_tokens,
+                feat_dim,
                 &vals[..4],
                 vals.iter().sum::<f32>() / vals.len() as f32,
-                (vals.iter().map(|v| (v - vals.iter().sum::<f32>() / vals.len() as f32).powi(2)).sum::<f32>() / vals.len() as f32).sqrt(),
+                (vals
+                    .iter()
+                    .map(|v| (v - vals.iter().sum::<f32>() / vals.len() as f32).powi(2))
+                    .sum::<f32>()
+                    / vals.len() as f32)
+                    .sqrt(),
             );
         }
 
@@ -272,12 +315,11 @@ impl<B: Backend> AsrPipeline<B> {
     /// Run text generation on a single segment with pre-computed audio features.
     fn infer_segment(
         &self,
-        audio_features: &Tensor<B, 3>,
+        audio_features: &Tensor<3>,
         language: Option<&str>,
         context: &str,
     ) -> anyhow::Result<String> {
         let [_, num_audio_tokens, _feat_dim] = audio_features.dims();
-
 
         // Build full prompt: prefix + audio_pad * N + suffix, then replace
         // audio_pad embeddings with audio encoder features.
@@ -305,8 +347,8 @@ impl<B: Backend> AsrPipeline<B> {
         let before_ids = &prompt_ids[..before_len];
         let after_ids = &prompt_ids[after_start..];
 
-        let before_t = int_tensor_2d::<B>(before_ids, &self.device);
-        let after_t = int_tensor_2d::<B>(after_ids, &self.device);
+        let before_t = int_tensor_2d(before_ids, &self.device);
+        let after_t = int_tensor_2d(after_ids, &self.device);
         let before_embeds = self.model.thinker.model.embed_tokens.forward(before_t);
         let after_embeds = self.model.thinker.model.embed_tokens.forward(after_t);
 
@@ -320,7 +362,7 @@ impl<B: Backend> AsrPipeline<B> {
         let (prefill_cos, prefill_sin) = self
             .mrope
             .compute_cos_sin_from_positions(&total_positions[..seq_len], &self.device);
-        let causal_mask = model::create_causal_mask::<B>(seq_len, 0, &self.device);
+        let causal_mask = model::create_causal_mask(seq_len, 0, &self.device);
         let hidden_states = self.model.thinker.model.forward_embeds(
             current_embeds,
             &prefill_cos,
@@ -360,12 +402,12 @@ impl<B: Backend> AsrPipeline<B> {
             }
 
             generated.push(next_token_id);
-            let next_ids = int_tensor_2d::<B>(&[next_token_id], &self.device);
+            let next_ids = int_tensor_2d(&[next_token_id], &self.device);
             let next_embed = self.model.thinker.model.embed_tokens.forward(next_ids);
             let (step_cos, step_sin) = self
                 .mrope
                 .compute_cos_sin_from_positions(&[current_pos], &self.device);
-            let step_mask = model::create_causal_mask::<B>(1, kv_cache.seq_len(), &self.device);
+            let step_mask = model::create_causal_mask(1, kv_cache.seq_len(), &self.device);
             let hidden_states = self.model.thinker.model.forward_embeds(
                 next_embed,
                 &step_cos,
@@ -526,7 +568,7 @@ impl<B: Backend> AsrPipeline<B> {
     }
 }
 
-fn int_tensor_2d<B: Backend>(ids: &[u32], device: &B::Device) -> Tensor<B, 2, Int> {
+fn int_tensor_2d(ids: &[u32], device: &Device) -> Tensor<2, Int> {
     let ints: Vec<i32> = ids.iter().map(|&id| id as i32).collect();
-    Tensor::<B, 1, Int>::from_ints(ints.as_slice(), device).unsqueeze_dim::<2>(0)
+    Tensor::<1, Int>::from_ints(ints.as_slice(), device).unsqueeze_dim::<2>(0)
 }

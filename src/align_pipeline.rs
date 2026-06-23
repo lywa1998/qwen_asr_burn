@@ -1,25 +1,24 @@
-use burn::tensor::backend::Backend;
-use burn::tensor::{Int, Tensor};
+use burn::tensor::{Device, Int, Tensor};
 
-use crate::audio::{self, MelSpectrogram};
-use crate::config::{ForcedAlignerConfig, PreprocessorConfig};
-use crate::model::{self, create_mrope, Qwen3ASR, Qwen3ASRConfig};
+use crate::models::qwen_asr::config::{ForcedAlignerConfig, PreprocessorConfig};
+use crate::models::qwen_asr::{self as model, create_mrope, Qwen3ASR, Qwen3ASRConfig};
 #[cfg(feature = "metal")]
-use crate::pipeline::Bf16ToF32Adapter;
-use crate::text_processor::{self, TimestampItem};
-use crate::tokenizer::Qwen2Tokenizer;
+use crate::transcribe_pipeline::Bf16ToF32Adapter;
+use crate::utils::audio::{self, MelSpectrogram};
+use crate::utils::text_processor::{self, TimestampItem};
+use crate::utils::tokenizer::Qwen2Tokenizer;
 
-pub struct AlignPipeline<B: Backend> {
-    model: Qwen3ASR<B>,
+pub struct AlignPipeline {
+    model: Qwen3ASR,
     tokenizer: Qwen2Tokenizer,
     mel_extractor: MelSpectrogram,
-    mrope: model::MRoPE,
-    device: B::Device,
+    mrope: model::Qwen3ASRMRoPE,
+    device: Device,
     timestamp_segment_time: u32,
 }
 
-impl<B: Backend> AlignPipeline<B> {
-    pub fn new(model_dir: &str, device: B::Device) -> anyhow::Result<Self> {
+impl AlignPipeline {
+    pub fn new(model_dir: &str, device: Device) -> anyhow::Result<Self> {
         let aligner_config = ForcedAlignerConfig::from_dir(model_dir)?;
         let thinker_cfg = &aligner_config.thinker_config;
         let audio_config = thinker_cfg.audio_config.clone();
@@ -33,7 +32,9 @@ impl<B: Backend> AlignPipeline<B> {
 
         let weights_path = format!("{}/model.safetensors", model_dir);
         {
-            use burn_store::{ChainAdapter, ModuleSnapshot, PyTorchToBurnAdapter, SafetensorsStore};
+            #[cfg(feature = "metal")]
+            use burn_store::ChainAdapter;
+            use burn_store::{ModuleSnapshot, PyTorchToBurnAdapter, SafetensorsStore};
             #[cfg(feature = "metal")]
             let adapter = ChainAdapter::new(PyTorchToBurnAdapter, Bf16ToF32Adapter);
             #[cfg(not(feature = "metal"))]
@@ -103,8 +104,8 @@ impl<B: Backend> AlignPipeline<B> {
         let n_frames = mel_spec[0].len();
         let flat: Vec<f32> = mel_spec.into_iter().flatten().collect();
         log::info!("Mel: {n_mels} bins x {n_frames} frames (padded to 30s)");
-        let mel_tensor = Tensor::<B, 1>::from_floats(flat.as_slice(), &self.device)
-            .reshape([1, n_mels, n_frames]);
+        let mel_tensor =
+            Tensor::<1>::from_floats(flat.as_slice(), &self.device).reshape([1, n_mels, n_frames]);
 
         // 2. Run audio encoder
         let audio_features = self.model.thinker.audio_tower.forward(mel_tensor);
@@ -127,10 +128,14 @@ impl<B: Backend> AlignPipeline<B> {
 
         // 6. Embed input tokens
         let input_ids_i32: Vec<i32> = input_ids.iter().map(|&id| id as i32).collect();
-        let input_ids_tensor =
-            Tensor::<B, 1, Int>::from_ints(input_ids_i32.as_slice(), &self.device)
-                .unsqueeze_dim::<2>(0);
-        let inputs_embeds = self.model.thinker.model.embed_tokens.forward(input_ids_tensor);
+        let input_ids_tensor = Tensor::<1, Int>::from_ints(input_ids_i32.as_slice(), &self.device)
+            .unsqueeze_dim::<2>(0);
+        let inputs_embeds = self
+            .model
+            .thinker
+            .model
+            .embed_tokens
+            .forward(input_ids_tensor);
 
         // 7. Replace audio_pad positions with encoder features
         let audio_pad_id = self.tokenizer.audio_pad;
@@ -153,12 +158,8 @@ impl<B: Backend> AlignPipeline<B> {
         let end = pad_positions[pad_positions.len() - 1] + 1;
 
         let hidden = inputs_embeds.dims()[2];
-        let prefix = inputs_embeds
-            .clone()
-            .slice([0..1, 0..start, 0..hidden]);
-        let suffix = inputs_embeds
-            .clone()
-            .slice([0..1, end..seq_len, 0..hidden]);
+        let prefix = inputs_embeds.clone().slice([0..1, 0..start, 0..hidden]);
+        let suffix = inputs_embeds.clone().slice([0..1, end..seq_len, 0..hidden]);
         let replaced_embeds = Tensor::cat(vec![prefix, audio_features, suffix], 1);
 
         // 8. Single forward pass with causal mask
@@ -166,8 +167,7 @@ impl<B: Backend> AlignPipeline<B> {
         let (cos, sin) = self
             .mrope
             .compute_cos_sin_from_positions(&total_positions, &self.device);
-        let causal_mask =
-            model::create_causal_mask::<B>(replaced_embeds.dims()[1], 0, &self.device);
+        let causal_mask = model::create_causal_mask(replaced_embeds.dims()[1], 0, &self.device);
 
         let hidden_states = self.model.thinker.model.forward_embeds(
             replaced_embeds,
@@ -180,11 +180,9 @@ impl<B: Backend> AlignPipeline<B> {
         let logit_seq_len = logits.dims()[1];
 
         // 9. Extract logits at timestamp positions
-        let timestamp_id = *self
-            .tokenizer
-            .timestamp_id
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("tokenizer is missing <timestamp> (required for alignment)"))?;
+        let timestamp_id = *self.tokenizer.timestamp_id.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("tokenizer is missing <timestamp> (required for alignment)")
+        })?;
         let timestamp_positions: Vec<usize> = input_ids
             .iter()
             .enumerate()

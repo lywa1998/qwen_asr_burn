@@ -3,7 +3,7 @@ use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
-pub struct ModelConfig {
+pub struct HYV3Config {
     pub hidden_size: usize,
     pub num_hidden_layers: usize,
     pub num_attention_heads: usize,
@@ -52,7 +52,7 @@ fn default_one() -> f64 {
     1.0
 }
 
-impl ModelConfig {
+impl HYV3Config {
     pub fn from_file(path: &str) -> anyhow::Result<Self> {
         let content =
             std::fs::read_to_string(path).with_context(|| format!("Failed to read {path}"))?;

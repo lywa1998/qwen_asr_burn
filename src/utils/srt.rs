@@ -1,4 +1,4 @@
-use crate::vad::VoiceSegment;
+use super::vad::VoiceSegment;
 
 /// Write SRT subtitle file from aligned segment timestamps and texts.
 pub fn write_srt(segments: &[VoiceSegment], texts: &[String], output_path: &str) -> anyhow::Result<()> {

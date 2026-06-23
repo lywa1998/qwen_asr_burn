@@ -1,39 +1,18 @@
 #![recursion_limit = "256"]
 
 mod align_pipeline;
-mod audio;
-mod config;
-#[cfg(feature = "hy-mt")]
-mod hy_mt;
-mod model;
 mod models;
-mod pipeline;
-mod srt;
-mod text_processor;
-mod tokenizer;
-mod vad;
-mod video;
+mod transcribe_pipeline;
+mod translate_pipeline;
+mod utils;
 
 use align_pipeline::AlignPipeline;
+use burn::tensor::Device;
+#[cfg(feature = "metal")]
+use burn::tensor::DeviceKind;
 use clap::Parser;
-use pipeline::AsrPipeline;
-
-#[cfg(feature = "cuda")]
-use burn::backend::{cuda::CudaDevice, Cuda};
-
-#[cfg(feature = "metal")]
-use burn::backend::{wgpu::WgpuDevice, Wgpu};
-
-#[cfg(all(feature = "cuda", feature = "bf16"))]
-use burn::tensor::bf16;
-#[cfg(all(feature = "cuda", feature = "bf16"))]
-type Backend = Cuda<bf16, i32>;
-
-#[cfg(all(feature = "cuda", not(feature = "bf16")))]
-type Backend = Cuda<f32, i32>;
-
-#[cfg(feature = "metal")]
-type Backend = Wgpu<f32, i32>;
+use transcribe_pipeline::TranscribePipeline;
+use translate_pipeline::TranslatePipeline;
 
 #[derive(Parser)]
 #[command(name = "qwen-asr", version, about = "Qwen3-ASR with Burn (BF16)")]
@@ -87,18 +66,19 @@ enum Command {
         #[arg(short, long)]
         output: Option<String>,
     },
-    /// Start Hy-MT (Hunyuan Machine Translation) API server
-    #[cfg(feature = "hy-mt")]
-    Serve {
-        /// Model directory (default: Hy-MT2-1.8B)
-        #[arg(short, long, default_value = "Hy-MT2-1.8B")]
-        model_dir: String,
-        /// Host to bind to
-        #[arg(long, default_value = "127.0.0.1")]
-        host: String,
-        /// Port to bind to
-        #[arg(long, default_value_t = 3000)]
-        port: u16,
+    /// Translate text with Hy-MT (Hunyuan Machine Translation).
+    Translate {
+        /// Input text. If this looks like a path to an existing file, the file is read instead.
+        input: String,
+        /// Target language (e.g. "English", "中文", "Japanese").
+        #[arg(short = 't', long, default_value = "English")]
+        target: String,
+        /// Hy-MT model directory. Overrides the global --model-dir when set.
+        #[arg(short = 'M', long)]
+        translate_model_dir: Option<String>,
+        /// Output text file (default: <input_stem>_translated.txt for file input; stdout only for inline text).
+        #[arg(short, long)]
+        output: Option<String>,
     },
 }
 
@@ -107,9 +87,9 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     #[cfg(feature = "cuda")]
-    let device = CudaDevice::default();
+    let device: Device = Device::cuda(0);
     #[cfg(feature = "metal")]
-    let device = WgpuDevice::default();
+    let device: Device = Device::metal(DeviceKind::DefaultDevice);
 
     match cli.command {
         Command::Transcribe {
@@ -120,7 +100,7 @@ fn main() -> anyhow::Result<()> {
             save_srt,
         } => {
             log::info!("Initializing Qwen3-ASR...");
-            let pipeline = AsrPipeline::<Backend>::new(&cli.model_dir, device)?;
+            let pipeline = TranscribePipeline::new(&cli.model_dir, device.clone())?;
             log::info!("Transcribing: {} (language={:?})", input, language);
             let (texts, segments) = pipeline.transcribe(&input, language.as_deref(), &context)?;
             let combined = texts.join("\n");
@@ -142,7 +122,7 @@ fn main() -> anyhow::Result<()> {
 
             if save_srt && !segments.is_empty() {
                 let srt_path = format!("{stem}.srt");
-                srt::write_srt(&segments, &texts, &srt_path)?;
+                utils::srt::write_srt(&segments, &texts, &srt_path)?;
             }
         }
         Command::Align {
@@ -152,7 +132,7 @@ fn main() -> anyhow::Result<()> {
             format,
         } => {
             log::info!("Initializing Qwen3-ForcedAligner...");
-            let pipeline = AlignPipeline::<Backend>::new(&cli.model_dir, device)?;
+            let pipeline = AlignPipeline::new(&cli.model_dir, device.clone())?;
             log::info!("Aligning: {} with language={}", input, language);
             let results = pipeline.align(&input, &text, &language)?;
             match format.as_str() {
@@ -167,17 +147,6 @@ fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        #[cfg(feature = "hy-mt")]
-        Command::Serve {
-            model_dir,
-            host,
-            port,
-        } => {
-            let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(hy_mt::server::run::<Backend>(
-                &model_dir, &host, port, device,
-            ))?;
-        }
         Command::Extract { input, output } => {
             let output_path = output.unwrap_or_else(|| {
                 let stem = std::path::Path::new(&input)
@@ -187,10 +156,45 @@ fn main() -> anyhow::Result<()> {
                 format!("{stem}.wav")
             });
             log::info!("Extracting audio from: {input}");
-            let samples = video::extract_audio(&input)?;
-            video::save_audio_wav(&samples, &output_path)?;
+            let samples = utils::video::extract_audio(&input)?;
+            utils::video::save_audio_wav(&samples, &output_path)?;
             let duration = samples.len() as f64 / 16_000.0;
             println!("Extracted {:.2}s audio → {output_path}", duration);
+        }
+        Command::Translate {
+            input,
+            target,
+            translate_model_dir,
+            output,
+        } => {
+            let model_dir = translate_model_dir.as_deref().unwrap_or(&cli.model_dir);
+            let input_path = std::path::Path::new(&input);
+            let (text, source_stem) = if input_path.is_file() {
+                let stem = input_path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("output")
+                    .to_string();
+                (std::fs::read_to_string(input_path)?, Some(stem))
+            } else {
+                (input.clone(), None)
+            };
+
+            log::info!("Initializing Hy-MT translator from {model_dir}");
+            let pipeline = TranslatePipeline::new(model_dir, device.clone())?;
+            log::info!("Translating to {target}");
+            let translated = pipeline.translate(text.trim(), &target)?;
+            println!("{translated}");
+
+            let out_path = output.or_else(|| {
+                source_stem
+                    .as_ref()
+                    .map(|stem| format!("{stem}_translated.txt"))
+            });
+            if let Some(path) = out_path {
+                std::fs::write(&path, &translated)?;
+                log::info!("Wrote translation to {path}");
+            }
         }
     }
     Ok(())
