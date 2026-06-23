@@ -26,7 +26,20 @@ pub struct AudioEncoderConfig {
     pub output_dim: usize,
     pub max_source_positions: usize,
     pub activation_function: String,
+    #[serde(default = "default_false")]
+    pub scale_embedding: bool,
+    #[serde(default = "default_n_window")]
+    pub n_window: usize,
+    #[serde(default = "default_n_window_infer")]
+    pub n_window_infer: usize,
+    #[serde(default = "default_conv_chunksize")]
+    pub conv_chunksize: usize,
 }
+
+fn default_false() -> bool { false }
+fn default_n_window() -> usize { 50 }
+fn default_n_window_infer() -> usize { 800 }
+fn default_conv_chunksize() -> usize { 500 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]

@@ -73,6 +73,9 @@ impl Qwen3ASRConfig {
                     audio_config.num_mel_bins,
                     audio_config.output_dim,
                     eps,
+                    audio_config.n_window,
+                    audio_config.n_window_infer,
+                    audio_config.conv_chunksize,
                 ),
                 Qwen3ASRTextConfig::new(
                     text_config.vocab_size,
@@ -104,6 +107,9 @@ impl Qwen3ASRConfig {
             audio_config.num_mel_bins,
             audio_config.output_dim,
             eps,
+            audio_config.n_window,
+            audio_config.n_window_infer,
+            audio_config.conv_chunksize,
         );
         let model = Qwen3ASRTextConfig::new(
             text_config.vocab_size,
