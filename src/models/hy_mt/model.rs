@@ -1,4 +1,5 @@
 use burn::module::Module;
+use burn::module::Param;
 use burn::nn;
 use burn::tensor::{Int, Tensor};
 
@@ -43,6 +44,17 @@ impl HYV3ForCausalLM {
             },
             lm_head,
         }
+    }
+
+    /// Copy `embed_tokens.weight` into `lm_head.weight` (transposed) to handle
+    /// `tie_word_embeddings: true` checkpoints, where `lm_head.weight` is
+    /// absent from safetensors. Embedding stores `[vocab, hidden]`; burn's
+    /// Linear stores `[d_input, d_output]` = `[hidden, vocab]`, so a transpose
+    /// is required.
+    pub fn tie_lm_head_to_embeddings(&mut self) {
+        let embed = self.model.embed_tokens.weight.val();
+        let tied = embed.swap_dims(0, 1);
+        self.lm_head.weight = Param::from_tensor(tied);
     }
 
     /// input_ids: [batch, seq_len] Int

@@ -1,0 +1,14 @@
+{
+  "eval_id": 2,
+  "eval_name": "migrate-api",
+  "prompt": "I'm upgrading a Burn 0.19 project to 0.21. Here's my model code that broke:\n\n```rust\n#[derive(Module, Debug)]\npub struct Model<B: Backend> {\n    conv1: Conv2d<B>,\n    conv2: Conv2d<B>,\n    linear: Linear<B>,\n    activation: Gelu,\n}\n\nimpl<B: Backend> Model<B> {\n    pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 2> {\n        // ...\n    }\n}\n```\n\nAlso, I have `Ignored<PaddingConfig1d>` on one field and `PaddingConfig1d::Explicit(1)` elsewhere. And I match on `DType::Bool` in some validation code. What do I need to change to compile on 0.21?",
+  "assertions": [
+    "Explains removing B: Backend generic from struct and impl",
+    "Shows Tensor<B, D> → Tensor<D> conversion",
+    "Covers Ignored<T> → #[module(skip)] replacement",
+    "Covers PaddingConfig1d::Explicit(1) → Explicit(1, 1)",
+    "Mentions Gelu → Gelu::new() or Gelu::default()",
+    "Covers DType::Bool → DType::Bool(_) match arm update",
+    "Mentions BinFileRecorder forward-compat or record migration warning"
+  ]
+}

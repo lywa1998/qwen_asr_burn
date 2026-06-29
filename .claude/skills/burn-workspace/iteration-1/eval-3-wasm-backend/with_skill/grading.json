@@ -1,0 +1,45 @@
+{
+  "expectations": [
+    {
+      "text": "Recommends burn-flex backend for WASM/embedded",
+      "passed": true,
+      "evidence": "burn-flex recommended: True"
+    },
+    {
+      "text": "Mentions burn-ndarray is deprecated in 0.21",
+      "passed": true,
+      "evidence": "ndarray deprecation mentioned: True"
+    },
+    {
+      "text": "Cargo features: flex, store, default-features = false",
+      "passed": true,
+      "evidence": "Correct features mentioned: True"
+    },
+    {
+      "text": "Uses include_bytes! to embed model weights at compile time",
+      "passed": true,
+      "evidence": "include_bytes! found: True"
+    },
+    {
+      "text": "Uses ModuleRecord::from_bytes for no-filesystem loading",
+      "passed": true,
+      "evidence": "ModuleRecord::from_bytes found: True"
+    },
+    {
+      "text": "Mentions Device::flex() for device selection",
+      "passed": true,
+      "evidence": "Device::flex() mentioned: True"
+    }
+  ],
+  "summary": {
+    "passed": 6,
+    "failed": 0,
+    "total": 6,
+    "pass_rate": 1.0
+  },
+  "timing": {
+    "total_tokens": 53685,
+    "duration_ms": 75711,
+    "total_duration_seconds": 75.7
+  }
+}

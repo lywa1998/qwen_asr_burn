@@ -8,12 +8,13 @@ pub struct TimestampItem {
 }
 
 /// Encode text with timestamp markers for forced alignment.
+/// Mirrors Python's `"<timestamp><timestamp>".join(word_list) + "<timestamp><timestamp>"`:
+/// each word is followed by exactly one timestamp pair, producing 2*N timestamps total.
 /// Returns (word_list, formatted_input_string).
 pub fn encode_timestamp(text: &str, language: &str) -> (Vec<String>, String) {
     let words = split_words(text, language);
     let timestamp_template = "<timestamp><timestamp>";
     let mut formatted = String::new();
-    formatted.push_str(timestamp_template);
     for word in &words {
         formatted.push_str(word);
         formatted.push_str(timestamp_template);

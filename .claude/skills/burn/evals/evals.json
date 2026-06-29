@@ -1,0 +1,49 @@
+{
+  "skill_name": "burn",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "I want to build a simple CNN classifier in Rust using Burn for the CIFAR-10 dataset. Write a complete setup: Cargo.toml, model.rs with a conv+linear stack, and a main.rs that initializes the model on WGPU. Use the current Burn 0.21 API — I don't want the old B: Backend generic style.",
+      "expected_output": "A working Burn 0.21 project with Cargo.toml (burn dependency with wgpu+train+vision features), model struct without B: Backend generics using #[derive(Module)], Device::wgpu() selection, and main.rs with #![recursion_limit = \"256\"].",
+      "files": [],
+      "expectations": [
+        "Cargo.toml includes burn with features wgpu, train, vision",
+        "Model struct uses #[derive(Module, Debug)] without B: Backend generic",
+        "model.init() takes &Device, not &B::Device",
+        "main.rs has #![recursion_limit = \"256\"]",
+        "Device is created with Device::wgpu(DeviceKind::DefaultDevice)",
+        "No Tensor<B, D> style — uses Tensor<D> without backend generic",
+        "Conv2d/Linear configs use .init(device) pattern"
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "I'm upgrading a Burn 0.19 project to 0.21. Here's my model code that broke:\n\n```rust\n#[derive(Module, Debug)]\npub struct Model<B: Backend> {\n    conv1: Conv2d<B>,\n    conv2: Conv2d<B>,\n    linear: Linear<B>,\n    activation: Gelu,\n}\n\nimpl<B: Backend> Model<B> {\n    pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 2> {\n        // ...\n    }\n}\n```\n\nAlso, I have `Ignored<PaddingConfig1d>` on one field and `PaddingConfig1d::Explicit(1)` elsewhere. And I match on `DType::Bool` in some validation code. What do I need to change to compile on 0.21?",
+      "expected_output": "A complete migration guide covering: remove B: Backend generic from struct/impl, replace Tensor<B,D> with Tensor<D>, Ignored<T> → #[module(skip)], PaddingConfig1d::Explicit(1) → Explicit(1,1), Gelu → Gelu::new(), DType::Bool → DType::Bool(_) or DType::Bool(BoolStore::Native), and mention that BinFileRecorder records are not forward-compatible.",
+      "files": [],
+      "expectations": [
+        "Explains removing B: Backend generic from struct and impl",
+        "Shows Tensor<B, D> → Tensor<D> conversion",
+        "Covers Ignored<T> → #[module(skip)] replacement",
+        "Covers PaddingConfig1d::Explicit(1) → Explicit(1, 1)",
+        "Mentions Gelu → Gelu::new() or Gelu::default()",
+        "Covers DType::Bool → DType::Bool(_) match arm update",
+        "Mentions BinFileRecorder forward-compat or record migration warning"
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "I need to run Burn inference in a WebAssembly browser app (no GPU, pure CPU). Which backend should I use? Also, tell me what Cargo.toml features I need and how to load model weights from a compiled-in bytes slice so I don't hit the filesystem at runtime. My model is already trained and saved as a .bpk file.",
+      "expected_output": "Recommend burn-flex (the new 0.21 pure-Rust CPU backend replacing burn-ndarray for WASM). Cargo features: flex + store, default-features = false. Load weights via ModuleRecord::from_bytes(include_bytes!(\"model.bpk\")). Mention burn-ndarray is deprecated.",
+      "files": [],
+      "expectations": [
+        "Recommends burn-flex backend for WASM/embedded",
+        "Mentions burn-ndarray is deprecated in 0.21",
+        "Cargo features: flex, store, default-features = false",
+        "Uses include_bytes! to embed model weights at compile time",
+        "Uses ModuleRecord::from_bytes for no-filesystem loading",
+        "Mentions Device::flex() for device selection"
+      ]
+    }
+  ]
+}

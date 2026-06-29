@@ -12,8 +12,8 @@ pub struct HYV3Attention {
     pub k_proj: nn::Linear,
     pub v_proj: nn::Linear,
     pub o_proj: nn::Linear,
-    pub query_layernorm: HYV3RMSNorm,
-    pub key_layernorm: HYV3RMSNorm,
+    pub q_norm: HYV3RMSNorm,
+    pub k_norm: HYV3RMSNorm,
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
@@ -39,8 +39,8 @@ impl HYV3Attention {
             o_proj: nn::LinearConfig::new(q_out, hidden)
                 .with_bias(false)
                 .init(device),
-            query_layernorm: HYV3RMSNorm::new(config.head_dim, device),
-            key_layernorm: HYV3RMSNorm::new(config.head_dim, device),
+            q_norm: HYV3RMSNorm::new(config.head_dim, device),
+            k_norm: HYV3RMSNorm::new(config.head_dim, device),
             num_heads: config.num_attention_heads,
             num_kv_heads: config.num_key_value_heads,
             head_dim: config.head_dim,
@@ -66,8 +66,8 @@ impl HYV3Attention {
         let k = k.reshape([batch, seq_len, self.num_kv_heads, self.head_dim]);
         let v = v.reshape([batch, seq_len, self.num_kv_heads, self.head_dim]);
 
-        let q = self.query_layernorm.forward_4d(q);
-        let k = self.key_layernorm.forward_4d(k);
+        let q = self.q_norm.forward_4d(q);
+        let k = self.k_norm.forward_4d(k);
 
         let q = q.swap_dims(1, 2);
         let k = k.swap_dims(1, 2);

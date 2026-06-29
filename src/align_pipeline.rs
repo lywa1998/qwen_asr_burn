@@ -96,14 +96,19 @@ impl AlignPipeline {
         text: &str,
         language: &str,
     ) -> anyhow::Result<Vec<TimestampItem>> {
-        // 1. Load, resample, and pad audio to 30s
+        // 1. Load and resample audio. Pad to a 30s multiple (no truncation)
+        //    so tail words still get valid mel frames.
         let samples = audio::load_wav_samples(audio_path)?;
-        let padded = audio::pad_to_30s(&samples);
+        let padded = audio::pad_to_30s_multiple(&samples);
         let mel_spec = self.mel_extractor.compute(&padded);
         let n_mels = mel_spec.len();
         let n_frames = mel_spec[0].len();
         let flat: Vec<f32> = mel_spec.into_iter().flatten().collect();
-        log::info!("Mel: {n_mels} bins x {n_frames} frames (padded to 30s)");
+        log::info!(
+            "Mel: {n_mels} bins x {n_frames} frames (padded {:.1}s → {:.1}s)",
+            samples.len() as f32 / 16_000.0,
+            padded.len() as f32 / 16_000.0
+        );
         let mel_tensor =
             Tensor::<1>::from_floats(flat.as_slice(), &self.device).reshape([1, n_mels, n_frames]);
 

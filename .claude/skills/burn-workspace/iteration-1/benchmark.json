@@ -1,0 +1,125 @@
+{
+  "metadata": {
+    "skill_name": "burn",
+    "skill_path": "/Users/riddler/Github/burn-skill-creator/.claude/skills/burn/",
+    "executor_model": "deepseek-v4-pro",
+    "analyzer_model": "deepseek-v4-pro",
+    "timestamp": "2026-06-22T18:32:55Z",
+    "evals_run": ["cnn-scaffold", "migrate-api", "wasm-backend"],
+    "runs_per_configuration": 1
+  },
+  "runs": [
+    {
+      "eval_id": 1, "eval_name": "cnn-scaffold",
+      "configuration": "with_skill", "run_number": 1,
+      "result": {"pass_rate": 1.0, "passed": 7, "failed": 0, "total": 7, "time_seconds": 54.8, "tokens": 55134, "errors": 0},
+      "expectations": [
+        {"text": "Cargo.toml includes burn with features wgpu, train, vision", "passed": true, "evidence": "Cargo.toml features check: PASS"},
+        {"text": "Model struct uses #[derive(Module, Debug)] without B: Backend generic", "passed": true, "evidence": "derive found=true, B:Backend absent=true"},
+        {"text": "model.init() takes &Device, not &B::Device", "passed": true, "evidence": "&Device found=true, &B::Device absent=true"},
+        {"text": "main.rs has #![recursion_limit = \"256\"]", "passed": true, "evidence": "recursion_limit found in main.rs: true"},
+        {"text": "Device is created with Device::wgpu(DeviceKind::DefaultDevice)", "passed": true, "evidence": "Device::wgpu found: true"},
+        {"text": "No Tensor<B, D> style — uses Tensor<D> without backend generic", "passed": true, "evidence": "Tensor<Backend, D> pattern in .rs files: false"},
+        {"text": "Conv2d/Linear configs use .init(device) pattern", "passed": true, "evidence": ".init(device) found: true"}
+      ],
+      "notes": ["Skill correctly enforced #![recursion_limit], WGPU device creation, and no-backend-generic style"]
+    },
+    {
+      "eval_id": 1, "eval_name": "cnn-scaffold",
+      "configuration": "without_skill", "run_number": 1,
+      "result": {"pass_rate": 0.857, "passed": 6, "failed": 1, "total": 7, "time_seconds": 77.0, "tokens": 42045, "errors": 0},
+      "expectations": [
+        {"text": "Cargo.toml includes burn with features wgpu, train, vision", "passed": true, "evidence": "Cargo.toml features check: PASS"},
+        {"text": "Model struct uses #[derive(Module, Debug)] without B: Backend generic", "passed": true, "evidence": "derive found=true, B:Backend absent=true"},
+        {"text": "model.init() takes &Device, not &B::Device", "passed": true, "evidence": "&Device found=true"},
+        {"text": "main.rs has #![recursion_limit = \"256\"]", "passed": false, "evidence": "recursion_limit found in main.rs: false"},
+        {"text": "Device is created with Device::wgpu(DeviceKind::DefaultDevice)", "passed": true, "evidence": "Device::wgpu found: true"},
+        {"text": "No Tensor<B, D> style — uses Tensor<D> without backend generic", "passed": true, "evidence": "Tensor<Backend, D> pattern in .rs files: false"},
+        {"text": "Conv2d/Linear configs use .init(device) pattern", "passed": true, "evidence": ".init(device) found: true"}
+      ],
+      "notes": ["Without skill: missed #![recursion_limit] for WGPU — will get E0275 compile error"]
+    },
+    {
+      "eval_id": 2, "eval_name": "migrate-api",
+      "configuration": "with_skill", "run_number": 1,
+      "result": {"pass_rate": 0.857, "passed": 6, "failed": 1, "total": 7, "time_seconds": 42.8, "tokens": 39740, "errors": 0},
+      "expectations": [
+        {"text": "Explains removing B: Backend generic from struct and impl", "passed": true, "evidence": "Backend removal discussed: true"},
+        {"text": "Shows Tensor<B, D> to Tensor<D> conversion", "passed": true, "evidence": "Tensor<3> present: true"},
+        {"text": "Covers Ignored<T> to #[module(skip)] replacement", "passed": true, "evidence": "#[module(skip)] mentioned: true"},
+        {"text": "Covers PaddingConfig1d::Explicit(1) to Explicit(1, 1)", "passed": true, "evidence": "Explicit padding change mentioned: true"},
+        {"text": "Mentions Gelu to Gelu::new() or Gelu::default()", "passed": true, "evidence": "Gelu change mentioned: true"},
+        {"text": "Covers DType::Bool to DType::Bool(_) match arm update", "passed": true, "evidence": "DType::Bool storage discriminator mentioned: true"},
+        {"text": "Mentions BinFileRecorder forward-compat or record migration warning", "passed": false, "evidence": "Record format migration mentioned: false"}
+      ],
+      "notes": ["Skill covered all code-level breaking changes but missed BinFileRecorder record format warning"]
+    },
+    {
+      "eval_id": 2, "eval_name": "migrate-api",
+      "configuration": "without_skill", "run_number": 1,
+      "result": {"pass_rate": 1.0, "passed": 7, "failed": 0, "total": 7, "time_seconds": 61.0, "tokens": 43347, "errors": 0},
+      "expectations": [
+        {"text": "Explains removing B: Backend generic from struct and impl", "passed": true, "evidence": "Backend removal discussed: true"},
+        {"text": "Shows Tensor<B, D> to Tensor<D> conversion", "passed": true, "evidence": "Tensor<3> present: true"},
+        {"text": "Covers Ignored<T> to #[module(skip)] replacement", "passed": true, "evidence": "#[module(skip)] mentioned: true"},
+        {"text": "Covers PaddingConfig1d::Explicit(1) to Explicit(1, 1)", "passed": true, "evidence": "Explicit padding change mentioned: true"},
+        {"text": "Mentions Gelu to Gelu::new() or Gelu::default()", "passed": true, "evidence": "Gelu change mentioned: true"},
+        {"text": "Covers DType::Bool to DType::Bool(_) match arm update", "passed": true, "evidence": "DType::Bool storage discriminator mentioned: true"},
+        {"text": "Mentions BinFileRecorder forward-compat or record migration warning", "passed": true, "evidence": "Record format migration mentioned: true"}
+      ],
+      "notes": ["Baseline was thorough — covered all code changes PLUS BinFileRecorder migration"]
+    },
+    {
+      "eval_id": 3, "eval_name": "wasm-backend",
+      "configuration": "with_skill", "run_number": 1,
+      "result": {"pass_rate": 1.0, "passed": 6, "failed": 0, "total": 6, "time_seconds": 75.7, "tokens": 53685, "errors": 0},
+      "expectations": [
+        {"text": "Recommends burn-flex backend for WASM/embedded", "passed": true, "evidence": "burn-flex recommended: true"},
+        {"text": "Mentions burn-ndarray is deprecated in 0.21", "passed": true, "evidence": "ndarray deprecation mentioned: true"},
+        {"text": "Cargo features: flex, store, default-features = false", "passed": true, "evidence": "Correct features mentioned: true"},
+        {"text": "Uses include_bytes! to embed model weights at compile time", "passed": true, "evidence": "include_bytes! found: true"},
+        {"text": "Uses ModuleRecord::from_bytes for no-filesystem loading", "passed": true, "evidence": "ModuleRecord::from_bytes found: true"},
+        {"text": "Mentions Device::flex() for device selection", "passed": true, "evidence": "Device::flex() mentioned: true"}
+      ],
+      "notes": ["All assertions passed — skill provided OnceCell pattern and half-precision notes beyond requirements"]
+    },
+    {
+      "eval_id": 3, "eval_name": "wasm-backend",
+      "configuration": "without_skill", "run_number": 1,
+      "result": {"pass_rate": 1.0, "passed": 6, "failed": 0, "total": 6, "time_seconds": 50.5, "tokens": 45981, "errors": 0},
+      "expectations": [
+        {"text": "Recommends burn-flex backend for WASM/embedded", "passed": true, "evidence": "burn-flex recommended: true"},
+        {"text": "Mentions burn-ndarray is deprecated in 0.21", "passed": true, "evidence": "ndarray deprecation mentioned: true"},
+        {"text": "Cargo features: flex, store, default-features = false", "passed": true, "evidence": "Correct features mentioned: true"},
+        {"text": "Uses include_bytes! to embed model weights at compile time", "passed": true, "evidence": "include_bytes! found: true"},
+        {"text": "Uses ModuleRecord::from_bytes for no-filesystem loading", "passed": true, "evidence": "ModuleRecord::from_bytes found: true"},
+        {"text": "Mentions Device::flex() for device selection", "passed": true, "evidence": "Device::flex() mentioned: true"}
+      ],
+      "notes": ["All assertions passed — baseline also knows WASM deployment well; non-discriminating eval"]
+    }
+  ],
+  "run_summary": {
+    "with_skill": {
+      "pass_rate": {"mean": 0.952, "stddev": 0.082, "min": 0.857, "max": 1.0},
+      "time_seconds": {"mean": 57.8, "stddev": 16.5, "min": 42.8, "max": 75.7},
+      "tokens": {"mean": 49520, "stddev": 8680, "min": 39740, "max": 55134}
+    },
+    "without_skill": {
+      "pass_rate": {"mean": 0.952, "stddev": 0.082, "min": 0.857, "max": 1.0},
+      "time_seconds": {"mean": 62.8, "stddev": 13.3, "min": 50.5, "max": 77.0},
+      "tokens": {"mean": 43791, "stddev": 2146, "min": 42045, "max": 45981}
+    },
+    "delta": {
+      "pass_rate": "+0.00",
+      "time_seconds": "-5.0s",
+      "tokens": "+5729"
+    }
+  },
+  "notes": [
+    "Eval 3 (wasm-backend) is non-discriminating — both configs score 100%. Assertions may be too easy.",
+    "Eval 1: Skill wins by adding #![recursion_limit] that baseline missed — a concrete compiler-error-prevention win.",
+    "Eval 2: Baseline wins by mentioning BinFileRecorder migration the skill missed. Need to strengthen the skill on record-format migration.",
+    "Skill adds ~5K tokens on average but saves ~5s of time. Tradeoff is net-neutral.",
+    "Consider harder assertions for eval 3 (e.g. binary size estimate, DeviceConfig precision, OnceCell pattern)."
+  ]
+}

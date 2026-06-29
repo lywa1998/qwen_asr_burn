@@ -1,0 +1,23 @@
+{
+  "skill_name": "transformers-to-burn",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "I'm looking at this Python transformers code for a decoder layer. Can you show me how to implement it in Burn Rust?\n\n```python\nclass MyDecoderLayer(nn.Module):\n    def __init__(self, config):\n        self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)\n        self.self_attn = MyAttention(config)\n        self.post_attention_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)\n        self.mlp = MyMLP(config)\n    \n    def forward(self, hidden_states, position_embeddings, attention_mask):\n        residual = hidden_states\n        hidden_states = self.input_layernorm(hidden_states)\n        hidden_states = self.self_attn(hidden_states, position_embeddings, attention_mask)\n        hidden_states = residual + hidden_states\n        residual = hidden_states\n        hidden_states = self.post_attention_layernorm(hidden_states)\n        hidden_states = self.mlp(hidden_states)\n        hidden_states = residual + hidden_states\n        return hidden_states\n```",
+      "expected_output": "A Rust Burn implementation using #[derive(Module, Debug)], Param<Tensor<1>> for RMSNorm, pre-norm residual pattern, and super:: imports",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "How do I load safetensors weights from a HuggingFace model into a burn model? The original model uses BF16 weights and I'm running on macOS with Metal backend.",
+      "expected_output": "Explanation of SafetensorsStore with ChainAdapter(PyTorchToBurnAdapter, Bf16ToF32Adapter) for Metal, config deserialization from JSON, and load result handling",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "I need to port the Qwen3-ASR model from HuggingFace transformers to burn. The model has an audio encoder (conv2d + transformer layers), a text decoder with QK-norm and MRoPE, and they fuse via embedding replacement. Where do I start?",
+      "expected_output": "Step-by-step guidance: analyze component hierarchy, file organization under src/models/qwen_asr/, attention with QK-norm and multi-file split, encoder chunked processing, multimodal fusion pattern with slice-cat, and weight loading",
+      "files": []
+    }
+  ]
+}

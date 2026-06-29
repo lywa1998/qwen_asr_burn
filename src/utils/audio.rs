@@ -126,6 +126,18 @@ pub fn pad_to_30s(samples: &[f32]) -> Vec<f32> {
     }
 }
 
+/// Pad audio to the next multiple of 30 seconds (480,000 samples @ 16kHz).
+/// Used by the forced aligner, which mirrors Python's
+/// `padding=True, truncation=False` in WhisperFeatureExtractor — long inputs
+/// must not be truncated, or tail-word timestamps cluster at the boundary.
+pub fn pad_to_30s_multiple(samples: &[f32]) -> Vec<f32> {
+    const CHUNK: usize = 480_000;
+    let target = samples.len().div_ceil(CHUNK).max(1) * CHUNK;
+    let mut v = samples.to_vec();
+    v.resize(target, 0.0);
+    v
+}
+
 // ─── Hann window ────────────────────────────────────────────────────────────
 
 /// Standard Hann window: `0.5 * (1 - cos(2πi / (N-1)))`.

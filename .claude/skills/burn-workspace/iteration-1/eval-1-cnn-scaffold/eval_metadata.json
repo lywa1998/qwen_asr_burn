@@ -1,0 +1,14 @@
+{
+  "eval_id": 1,
+  "eval_name": "cnn-scaffold",
+  "prompt": "I want to build a simple CNN classifier in Rust using Burn for the CIFAR-10 dataset. Write a complete setup: Cargo.toml, model.rs with a conv+linear stack, and a main.rs that initializes the model on WGPU. Use the current Burn 0.21 API — I don't want the old B: Backend generic style.",
+  "assertions": [
+    "Cargo.toml includes burn with features wgpu, train, vision",
+    "Model struct uses #[derive(Module, Debug)] without B: Backend generic",
+    "model.init() takes &Device, not &B::Device",
+    "main.rs has #![recursion_limit = \"256\"]",
+    "Device is created with Device::wgpu(DeviceKind::DefaultDevice)",
+    "No Tensor<B, D> style — uses Tensor<D> without backend generic",
+    "Conv2d/Linear configs use .init(device) pattern"
+  ]
+}

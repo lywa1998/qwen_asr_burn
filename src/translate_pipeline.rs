@@ -23,11 +23,12 @@ pub struct GenerationConfig {
 
 impl Default for GenerationConfig {
     fn default() -> Self {
+        // Hy-MT 1.8B/7B recommended sampling params from the model README.
         Self {
-            max_new_tokens: 512,
+            max_new_tokens: 4096,
             temperature: 0.7,
             top_k: 20,
-            top_p: 0.8,
+            top_p: 0.6,
             do_sample: true,
             eos_token_id: 120_020,
         }
@@ -78,7 +79,9 @@ impl TranslatePipeline {
         let adapter = ChainAdapter::new(PyTorchToBurnAdapter, Bf16ToF32Adapter);
         #[cfg(not(feature = "metal"))]
         let adapter = PyTorchToBurnAdapter;
-        let mut store = SafetensorsStore::from_file(&safetensors_path).with_from_adapter(adapter);
+        let mut store = SafetensorsStore::from_file(&safetensors_path)
+            .with_from_adapter(adapter)
+            .allow_partial(true);
         let result = model
             .load_from(&mut store)
             .map_err(|e| anyhow::anyhow!("Failed to load Hy-MT weights: {e}"))?;
@@ -87,6 +90,14 @@ impl TranslatePipeline {
             result.applied.len(),
             result.errors.len()
         );
+
+        // Models with `tie_word_embeddings: true` omit `lm_head.weight` from
+        // safetensors; copy from embed_tokens. This is the standard HuggingFace
+        // pattern documented in PreTrainedModel._tied_weights_keys.
+        if model_config.tie_word_embeddings {
+            model.tie_lm_head_to_embeddings();
+            log::info!("Hy-MT: tied lm_head.weight ← embed_tokens.weight");
+        }
 
         let rope = HYV3RotaryEmbedding::new(&model_config);
         let gen_config = GenerationConfig::from_model_config(&model_config);
@@ -102,8 +113,7 @@ impl TranslatePipeline {
 
     /// Translate `text` into `target_lang` (e.g. "English", "中文").
     pub fn translate(&self, text: &str, target_lang: &str) -> anyhow::Result<String> {
-        let system = format!("Translate the following text into {target_lang}.");
-        let prompt = build_prompt(&system, text);
+        let prompt = build_prompt(target_lang, text);
         self.generate(&prompt)
     }
 
@@ -162,15 +172,20 @@ impl TranslatePipeline {
 
 // ── Prompt formatting ──────────────────────────────────────────────────────
 
-/// Minimal HunYuan chat-template formatter for a single user turn with
-/// a system instruction.
-fn build_prompt(system: &str, user: &str) -> String {
-    let mut p = String::with_capacity(system.len() + user.len() + 64);
+/// Hy-MT chat-template formatter. Per the model README, Hy-MT has no default
+/// system prompt — only a user turn is used. The recommended translation
+/// instruction template is hard-coded here.
+///
+/// chat_template.jinja (no system branch):
+///   <｜hy_begin▁of▁sentence｜><｜hy_User｜>{content}<｜hy_Assistant｜>
+fn build_prompt(target_lang: &str, source_text: &str) -> String {
+    let user_content = format!(
+        "Translate the following text into {target_lang}. Note that you should only output the translated result without any additional explanation:\n\n{source_text}"
+    );
+    let mut p = String::with_capacity(user_content.len() + 64);
     p.push_str("<｜hy_begin▁of▁sentence｜>");
-    p.push_str(system);
-    p.push_str("<｜hy_place▁holder▁no▁3｜>");
     p.push_str("<｜hy_User｜>");
-    p.push_str(user);
+    p.push_str(&user_content);
     p.push_str("<｜hy_Assistant｜>");
     p
 }

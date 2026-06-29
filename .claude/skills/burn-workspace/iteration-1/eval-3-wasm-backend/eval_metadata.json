@@ -1,0 +1,13 @@
+{
+  "eval_id": 3,
+  "eval_name": "wasm-backend",
+  "prompt": "I need to run Burn inference in a WebAssembly browser app (no GPU, pure CPU). Which backend should I use? Also, tell me what Cargo.toml features I need and how to load model weights from a compiled-in bytes slice so I don't hit the filesystem at runtime. My model is already trained and saved as a .bpk file.",
+  "assertions": [
+    "Recommends burn-flex backend for WASM/embedded",
+    "Mentions burn-ndarray is deprecated in 0.21",
+    "Cargo features: flex, store, default-features = false",
+    "Uses include_bytes! to embed model weights at compile time",
+    "Uses ModuleRecord::from_bytes for no-filesystem loading",
+    "Mentions Device::flex() for device selection"
+  ]
+}

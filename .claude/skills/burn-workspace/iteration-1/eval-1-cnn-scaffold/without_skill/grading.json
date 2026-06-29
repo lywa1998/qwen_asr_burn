@@ -1,0 +1,50 @@
+{
+  "expectations": [
+    {
+      "text": "Cargo.toml includes burn with features wgpu, train, vision",
+      "passed": true,
+      "evidence": "Cargo.toml features check: PASS"
+    },
+    {
+      "text": "Model struct uses #[derive(Module, Debug)] without B: Backend generic",
+      "passed": true,
+      "evidence": "derive found=True, B:Backend absent=True"
+    },
+    {
+      "text": "model.init() takes &Device, not &B::Device",
+      "passed": true,
+      "evidence": "&Device found=True, &B::Device absent=True"
+    },
+    {
+      "text": "main.rs has #![recursion_limit = \"256\"]",
+      "passed": false,
+      "evidence": "recursion_limit found in main.rs: False"
+    },
+    {
+      "text": "Device is created with Device::wgpu(DeviceKind::DefaultDevice)",
+      "passed": true,
+      "evidence": "Device::wgpu found: True, DeviceKind: True"
+    },
+    {
+      "text": "No Tensor<B, D> style \u2014 uses Tensor<D> without backend generic",
+      "passed": true,
+      "evidence": "Tensor<Backend, D> pattern absent: True"
+    },
+    {
+      "text": "Conv2d/Linear configs use .init(device) pattern",
+      "passed": true,
+      "evidence": ".init(device) found: True"
+    }
+  ],
+  "summary": {
+    "passed": 6,
+    "failed": 1,
+    "total": 7,
+    "pass_rate": 0.857
+  },
+  "timing": {
+    "total_tokens": 42045,
+    "duration_ms": 76997,
+    "total_duration_seconds": 77.0
+  }
+}
